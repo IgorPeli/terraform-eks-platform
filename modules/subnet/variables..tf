@@ -16,7 +16,21 @@ variable "tags" {
 }
 
 variable "availability_zone" {
-  type        = list(string)
+  type        = string
   description = "AZs from the subnet"
+
+}
+
+variable "is_public" {
+  type        = bool
+  description = "If the subnet it's public"
+  default     = false
+
+}
+
+variable "gateway_id" {
+  type        = string
+  description = "ID from my Internet Gateway"
+  default     = ""
 
 }

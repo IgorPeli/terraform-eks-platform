@@ -1,528 +1,246 @@
-# Arquitetura do Projeto Terraform
+# Projeto Terraform
 
-Este projeto esta organizado para separar claramente:
+Este repositorio e um projeto de estudo para organizar infraestrutura AWS com Terraform usando modulos reutilizaveis.
 
-- onde o Terraform e executado;
-- onde ficam os modulos reutilizaveis;
-- onde ficam as configuracoes de ambiente;
-- onde ficam os valores das variaveis.
+A ideia principal e:
 
-A ideia principal e: **environments instanciam modulos; modules definem recursos reutilizaveis**.
+- `modules/` guarda pecas reutilizaveis de infraestrutura;
+- `live/` e a configuracao ativa que instancia os modulos;
+- `environments/` guarda valores por ambiente, como `dev` e `prod`.
 
-## Estrutura de Pastas
+## O que esta sendo criado agora
+
+A configuracao ativa esta em `live/`.
+
+Ela cria uma rede AWS na regiao `us-east-2` usando o profile `terraform-local`:
+
+- uma VPC com CIDR `10.16.0.0/16`;
+- um Internet Gateway conectado na VPC;
+- quatro subnets usando o modulo `modules/subnet`;
+- duas subnets publicas;
+- duas subnets privadas;
+- output com o ID do Internet Gateway.
+
+As subnets usam as duas primeiras Availability Zones retornadas por:
+
+```hcl
+data "aws_availability_zones" "available" {
+  state = "available"
+}
+```
+
+## Estrutura atual
 
 ```text
 .
-├── environments
-│   └── dev
-│       ├── backend.tf
-│       ├── main.tf
-│       ├── outputs.tf
-│       ├── providers.tf
-│       ├── terraform.tfvars.example
-│       ├── variables.tf
-│       └── versions.tf
-└── modules
-    ├── ec2-instance
-    │   ├── main.tf
-    │   ├── outputs.tf
-    │   └── variables.tf
-    └── network
-        ├── main.tf
-        ├── outputs.tf
-        └── variables.tf
+|-- environments
+|   |-- dev
+|   |   |-- backend.tf
+|   |   `-- terraform.tfvars
+|   `-- prod
+|       |-- backend.tf
+|       `-- terraform.tfvars
+|-- live
+|   |-- 00_data.tf
+|   |-- 00_output.tf
+|   |-- 00_providers.tf
+|   |-- 00_variables.tf
+|   |-- 01_subnet.tf
+|   `-- 01_vpc.tf
+`-- modules
+    |-- subnet
+    |   |-- main.tf
+    |   `-- variables..tf
+    `-- vpc
+        |-- main.tf
+        |-- output.tf
+        `-- variables.tf
 ```
 
-## Visao Geral
+Observacao: o modulo `subnet` usa o arquivo `variables..tf` com dois pontos antes de `tf`. O Terraform ainda le arquivos `.tf`, mas esse nome pode ser ajustado depois para `variables.tf`.
 
-O Terraform trabalha melhor quando voce separa o projeto em duas partes:
+## Como executar
 
-1. **Ambientes**
-
-   Sao as pastas onde voce roda comandos como:
-
-   ```powershell
-   terraform init
-   terraform plan
-   terraform apply
-   ```
-
-   Neste projeto, o ambiente criado foi:
-
-   ```text
-   environments/dev
-   ```
-
-2. **Modulos**
-
-   Sao blocos reutilizaveis de infraestrutura.
-
-   Neste projeto, os modulos criados foram:
-
-   ```text
-   modules/network
-   modules/ec2-instance
-   ```
-
-O ambiente `dev` pode chamar os modulos. Os modulos nao chamam o ambiente.
-
-## Pasta `environments`
-
-A pasta `environments` representa os ambientes da sua infraestrutura.
-
-Exemplos comuns:
-
-```text
-environments/dev
-environments/staging
-environments/prod
-```
-
-Neste momento existe apenas:
-
-```text
-environments/dev
-```
-
-Sim, a ideia e exatamente simular que futuramente voce poderia ter `dev` e `prod`.
-
-Por exemplo:
-
-- `dev`: ambiente de estudo, teste ou desenvolvimento;
-- `prod`: ambiente real, mais controlado e estavel.
-
-Cada ambiente pode ter:
-
-- backend proprio;
-- variaveis proprias;
-- regiao propria;
-- tamanho diferente de instancia;
-- quantidade diferente de recursos;
-- tags diferentes;
-- modulos instanciados com valores diferentes.
-
-## Pasta `environments/dev`
-
-Essa e a pasta principal para executar o Terraform no ambiente de desenvolvimento.
-
-Quando voce estiver trabalhando no ambiente `dev`, normalmente entra nela:
+Entre na pasta ativa:
 
 ```powershell
-cd environments/dev
+cd live
 ```
 
-E entao roda:
+Inicialize o Terraform:
 
 ```powershell
 terraform init
+```
+
+Formate os arquivos:
+
+```powershell
+terraform fmt -recursive
+```
+
+Valide a configuracao:
+
+```powershell
+terraform validate
+```
+
+Veja o plano:
+
+```powershell
 terraform plan
+```
+
+Aplique quando estiver pronto:
+
+```powershell
 terraform apply
 ```
 
-## Arquivo `versions.tf`
+## Modulo `modules/vpc`
 
-Esse arquivo costuma declarar:
+O modulo `vpc` cria uma VPC AWS.
 
-- versao minima do Terraform;
-- providers usados no projeto;
-- versao dos providers.
+### Recurso criado
 
-Exemplo conceitual:
+- `aws_vpc.main`
+
+### Entradas
+
+| Variavel | Tipo | Padrao | Descricao |
+| --- | --- | --- | --- |
+| `cidr_block` | `string` | `"10.16.0.0/16"` | CIDR da VPC. |
+| `tags` | `map(string)` | sem padrao | Tags extras para a VPC. |
+
+### Saidas
+
+| Output | Descricao |
+| --- | --- |
+| `vpc_id` | ID da VPC criada. |
+
+### Exemplo de uso
+
+Exemplo usado em `live/01_vpc.tf`:
 
 ```hcl
-terraform {
-  required_version = ">= 1.6.0"
+module "vpc" {
+  source     = "../modules/vpc"
+  cidr_block = "10.16.0.0/16"
 
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.0"
+  tags = merge(
+    var.environment_tags,
+    {
+      Owner = "Ig0d"
     }
-  }
+  )
 }
 ```
 
-Esse arquivo nao cria recurso. Ele define requisitos.
-
-## Arquivo `providers.tf`
-
-Esse arquivo configura o provider.
-
-Provider e o plugin que permite o Terraform conversar com uma plataforma.
-
-Exemplos de providers:
-
-- `aws`;
-- `azurerm`;
-- `google`;
-- `kubernetes`;
-- `github`.
-
-No caso da AWS, normalmente voce configura a regiao:
+Depois, outros recursos podem usar:
 
 ```hcl
-provider "aws" {
-  region = var.aws_region
+module.vpc.vpc_id
+```
+
+## Modulo `modules/subnet`
+
+O modulo `subnet` cria uma subnet AWS. Quando `is_public = true`, ele tambem cria uma route table e uma rota padrao para um Internet Gateway.
+
+### Recursos criados
+
+- `aws_subnet.subnet`
+- `aws_route_table.rt`, somente para subnet publica
+- `aws_route.route`, somente para subnet publica
+
+### Entradas
+
+| Variavel | Tipo | Padrao | Descricao |
+| --- | --- | --- | --- |
+| `vpc_id` | `string` | sem padrao | ID da VPC onde a subnet sera criada. |
+| `cidr_block` | `string` | sem padrao | CIDR da subnet. |
+| `tags` | `map(string)` | sem padrao | Tags extras para a subnet. |
+| `availability_zone` | `string` | sem padrao | Availability Zone da subnet. |
+| `is_public` | `bool` | `false` | Define se a subnet e publica. |
+| `gateway_id` | `string` | `""` | ID do Internet Gateway usado na rota publica. |
+
+### Exemplo de subnet publica
+
+```hcl
+module "subnet-public-a" {
+  source            = "../modules/subnet"
+  vpc_id            = module.vpc.vpc_id
+  availability_zone = data.aws_availability_zones.available.names[0]
+  cidr_block        = "10.16.0.0/20"
+  is_public         = true
+  gateway_id        = aws_internet_gateway.internet_gateway.id
+
+  tags = merge(
+    var.environment_tags,
+    {
+      Owner = "Ig0d"
+      Name  = "public-a"
+    }
+  )
 }
 ```
 
-O provider depende da versao declarada em `versions.tf`, mas `providers.tf` e onde voce configura como ele sera usado.
+### Exemplo de subnet privada
 
-## Arquivo `backend.tf`
+```hcl
+module "subnet-private-a" {
+  source            = "../modules/subnet"
+  vpc_id            = module.vpc.vpc_id
+  availability_zone = data.aws_availability_zones.available.names[0]
+  cidr_block        = "10.16.32.0/20"
 
-Esse arquivo configura onde o Terraform vai guardar o state.
-
-O **state** e o arquivo que registra o que o Terraform criou.
-
-Sem backend remoto, o Terraform cria um arquivo local:
-
-```text
-terraform.tfstate
+  tags = merge(
+    var.environment_tags,
+    {
+      Owner = "Ig0d"
+      Name  = "private-a"
+    }
+  )
+}
 ```
 
-Em projetos reais, e comum usar backend remoto, por exemplo:
+## Configuracao `live`
 
-- S3 na AWS;
-- Azure Storage;
-- Google Cloud Storage;
-- Terraform Cloud.
+Arquivos principais:
 
-Para AWS, um backend comum seria S3 com DynamoDB para lock.
+| Arquivo | Funcao |
+| --- | --- |
+| `00_providers.tf` | Declara o provider AWS `~> 6.0`, regiao `us-east-2` e profile `terraform-local`. |
+| `00_variables.tf` | Declara `environment_tags`, usado para tags por ambiente. |
+| `00_data.tf` | Busca Availability Zones disponiveis. |
+| `00_output.tf` | Exporta o ID do Internet Gateway. |
+| `01_vpc.tf` | Instancia o modulo VPC e cria o Internet Gateway. |
+| `01_subnet.tf` | Instancia quatro subnets: duas publicas e duas privadas. |
 
-Importante: o bloco `backend` nao aceita variaveis normais como `var.nome`. Por isso, normalmente ele tem valores escritos diretamente ou e configurado via parametro no `terraform init`.
+## Ambientes
 
-## Arquivo `variables.tf`
+A pasta `environments/` tem valores separados para `dev` e `prod`:
 
-Esse arquivo declara as variaveis que o ambiente aceita.
+```text
+environments/dev/terraform.tfvars
+environments/prod/terraform.tfvars
+```
 
-Ele responde a pergunta:
-
-> Quais valores este ambiente precisa receber?
+Hoje esses arquivos definem apenas a tag `Environment`.
 
 Exemplo:
 
 ```hcl
-variable "aws_region" {
-  type        = string
-  description = "Regiao AWS onde os recursos serao criados."
+environment_tags = {
+  Environment = "dev"
 }
 ```
 
-Aqui voce esta apenas declarando que existe uma variavel chamada `aws_region`.
-
-Isso nao significa que voce ja deu valor a ela.
-
-## Arquivo `terraform.tfvars`
-
-O arquivo `terraform.tfvars` serve para passar valores para as variaveis declaradas em `variables.tf`.
-
-Se em `variables.tf` voce declara:
-
-```hcl
-variable "aws_region" {
-  type = string
-}
-```
-
-Em `terraform.tfvars`, voce pode preencher:
-
-```hcl
-aws_region = "us-east-1"
-```
-
-Entao a relacao e:
-
-```text
-variables.tf      declara a variavel
-terraform.tfvars  define o valor da variavel
-```
-
-O `tfvars` **nao e baseado na versao do provider**.
-
-Ele e baseado nas variaveis que voce mesmo criou.
-
-Ou seja:
-
-- o provider define quais recursos e argumentos existem;
-- o `variables.tf` define quais entradas seu codigo aceita;
-- o `terraform.tfvars` passa valores para essas entradas.
-
-## Arquivo `terraform.tfvars.example`
-
-Neste projeto existe um arquivo:
-
-```text
-terraform.tfvars.example
-```
-
-Ele serve como modelo.
-
-A ideia e voce copiar:
-
-```powershell
-Copy-Item terraform.tfvars.example terraform.tfvars
-```
-
-E preencher o `terraform.tfvars` real.
-
-Normalmente o arquivo `terraform.tfvars` nao vai para o Git, porque pode conter dados sensiveis ou configuracoes locais.
-
-Ja o `terraform.tfvars.example` pode ir para o Git, porque serve apenas como referencia.
-
-## Arquivo `main.tf` no Ambiente
-
-O `main.tf` dentro de `environments/dev` normalmente e onde voce instancia os modulos.
-
-Exemplo conceitual:
-
-```hcl
-module "network" {
-  source = "../../modules/network"
-}
-```
-
-Esse bloco significa:
-
-> Ambiente dev, use o modulo network que esta dentro da pasta modules/network.
-
-O ambiente e quem decide quais modulos usar.
-
-## Arquivo `outputs.tf` no Ambiente
-
-Esse arquivo mostra informacoes importantes depois do `terraform apply`.
-
-Exemplos:
-
-- ID da VPC;
-- IP publico de uma instancia;
-- nome de um bucket;
-- endpoint de uma aplicacao.
-
-Outputs ajudam voce a enxergar o resultado da infraestrutura criada.
-
-## Pasta `modules`
-
-A pasta `modules` guarda blocos reutilizaveis.
-
-Um modulo deve ser pensado como uma peca de Lego da infraestrutura.
-
-Exemplos:
-
-- modulo de rede;
-- modulo de instancia EC2;
-- modulo de banco de dados;
-- modulo de bucket S3;
-- modulo de IAM;
-- modulo de cluster Kubernetes.
-
-Neste projeto existem dois modulos iniciais:
-
-```text
-modules/network
-modules/ec2-instance
-```
-
-## Modulo `modules/network`
-
-Esse modulo deve ser responsavel por recursos de rede.
-
-Exemplos de recursos que poderiam ficar nele:
-
-- VPC;
-- subnets;
-- route tables;
-- internet gateway;
-- NAT gateway;
-- security groups de rede, se fizer sentido no seu desenho.
-
-Arquivos:
-
-```text
-modules/network/main.tf
-modules/network/variables.tf
-modules/network/outputs.tf
-```
-
-### `main.tf` do modulo
-
-Onde voce declara os recursos do modulo.
-
-### `variables.tf` do modulo
-
-Onde voce declara quais valores o modulo precisa receber.
-
-Exemplo:
-
-```hcl
-variable "vpc_cidr" {
-  type = string
-}
-```
-
-### `outputs.tf` do modulo
-
-Onde voce exporta valores para quem chamou o modulo.
-
-Exemplo:
-
-```hcl
-output "vpc_id" {
-  value = aws_vpc.this.id
-}
-```
-
-Isso permite que o ambiente use:
-
-```hcl
-module.network.vpc_id
-```
-
-## Modulo `modules/ec2-instance`
-
-Esse modulo deve ser responsavel por criar uma instancia EC2.
-
-Exemplos de coisas que poderiam ficar nele:
-
-- instancia EC2;
-- security group da instancia;
-- user data;
-- volume EBS;
-- elastic IP, se necessario.
-
-Arquivos:
-
-```text
-modules/ec2-instance/main.tf
-modules/ec2-instance/variables.tf
-modules/ec2-instance/outputs.tf
-```
-
-Esse modulo provavelmente receberia valores como:
-
-- AMI;
-- tipo da instancia;
-- subnet;
-- security groups;
-- nome da instancia;
-- tags.
-
-## Fluxo Mental do Projeto
-
-Pense assim:
-
-```text
-environments/dev
-    chama
-        modules/network
-        modules/ec2-instance
-```
-
-O ambiente `dev` e o "orquestrador".
-
-Os modulos sao as "pecas".
-
-O ambiente passa valores para os modulos.
-
-Os modulos criam recursos.
-
-Os modulos devolvem outputs.
-
-O ambiente pode usar esses outputs para conectar uma coisa na outra.
-
-## Exemplo de Conexao Entre Modulos
-
-Imagine que o modulo `network` cria uma subnet e exporta:
-
-```hcl
-output "public_subnet_id" {
-  value = aws_subnet.public.id
-}
-```
-
-Depois o ambiente `dev` pode passar essa subnet para o modulo de EC2:
-
-```hcl
-module "ec2" {
-  source    = "../../modules/ec2-instance"
-  subnet_id = module.network.public_subnet_id
-}
-```
-
-Isso e uma das partes mais importantes do Terraform modular:
-
-```text
-um modulo cria algo
-outro modulo usa esse resultado
-o ambiente conecta os dois
-```
-
-## Por que Esse Jeito e Bom?
-
-Essa organizacao e boa porque:
-
-- evita deixar todos os recursos em um unico arquivo gigante;
-- facilita reaproveitar codigo;
-- deixa claro onde executar o Terraform;
-- separa configuracao de ambiente da definicao dos recursos;
-- facilita criar `dev`, `staging` e `prod` depois;
-- ajuda voce a entender a dependencia entre recursos;
-- aproxima seu projeto de uma estrutura usada em projetos reais.
-
-## O que Evitar
-
-Evite colocar tudo em uma unica pasta quando o projeto comecar a crescer.
-
-Por exemplo:
-
-```text
-main.tf
-variables.tf
-outputs.tf
-vpc.tf
-ec2.tf
-rds.tf
-iam.tf
-bucket.tf
-```
-
-Isso ate funciona no inicio, mas com o tempo fica mais dificil entender:
-
-- o que pertence a rede;
-- o que pertence a compute;
-- o que muda por ambiente;
-- o que pode ser reutilizado;
-- o que e configuracao;
-- o que e modulo.
-
-## Ordem Recomendada Para Estudar
-
-Uma boa ordem para preencher manualmente os arquivos seria:
-
-1. `environments/dev/versions.tf`
-2. `environments/dev/providers.tf`
-3. `environments/dev/variables.tf`
-4. `environments/dev/main.tf`
-5. `modules/network/variables.tf`
-6. `modules/network/main.tf`
-7. `modules/network/outputs.tf`
-8. `modules/ec2-instance/variables.tf`
-9. `modules/ec2-instance/main.tf`
-10. `modules/ec2-instance/outputs.tf`
-11. `environments/dev/outputs.tf`
-12. `environments/dev/backend.tf`
-
-Eu deixaria o `backend.tf` por ultimo, porque primeiro e melhor entender provider, recurso, variavel, modulo e output. Depois voce coloca backend remoto.
-
-## Resumo Curto
-
-```text
-versions.tf             versoes do Terraform e providers
-providers.tf            configuracao do provider
-backend.tf              onde o state sera salvo
-variables.tf            declara variaveis
-terraform.tfvars        passa valores para variaveis
-main.tf                 cria recursos ou instancia modulos
-outputs.tf              mostra ou exporta resultados
-modules/                pecas reutilizaveis
-environments/           ambientes que usam os modulos
-```
+Eles ainda nao estao conectados diretamente a uma configuracao raiz propria. A execucao ativa do projeto acontece em `live/`.
+
+## Proximos passos naturais
+
+- Passar `gateway_id` para os modulos de subnet publica em `live/01_subnet.tf`.
+- Criar associacao explicita entre route table publica e subnet publica.
+- Adicionar outputs no modulo `subnet`, como subnet ID e route table ID.
+- Renomear `modules/subnet/variables..tf` para `variables.tf`.
+- Decidir se `environments/dev` e `environments/prod` vao virar roots Terraform completos ou apenas arquivos de valores.
