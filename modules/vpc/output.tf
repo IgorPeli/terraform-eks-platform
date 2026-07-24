@@ -1,5 +1,5 @@
-output "vpc_arn" {
+output "vpc_id" {
   description = "Nome da VPC"
-  value       = aws_vpc.main.arn
+  value       = aws_vpc.main.id
 
 }
