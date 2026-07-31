@@ -19,7 +19,10 @@ Ela cria uma rede AWS na regiao `us-east-2` usando o profile `terraform-local`:
 - quatro subnets usando o modulo `modules/subnet`;
 - duas subnets publicas;
 - duas subnets privadas;
-- output com o ID do Internet Gateway.
+- output com o ID do Internet Gateway;
+- security groups separados para o EKS e para o Interface Endpoint;
+- regras de DNS e HTTPS entre o EKS e o endpoint;
+- VPC Interface Endpoint do ECR nas subnets privadas.
 
 As subnets usam as duas primeiras Availability Zones retornadas por:
 
@@ -48,6 +51,11 @@ data "aws_availability_zones" "available" {
 |   |-- 01_subnet.tf
 |   `-- 01_vpc.tf
 `-- modules
+    |-- endpoint_interface
+    |-- security_group_egress
+    |-- security_group_egress_rule.tf
+    |-- security_group_ingress
+    |-- security_group_ingress_rule.tf
     |-- subnet
     |   |-- main.tf
     |   `-- variables..tf
@@ -150,7 +158,10 @@ O modulo `subnet` cria uma subnet AWS. Quando `is_public = true`, ele tambem cri
 
 - `aws_subnet.subnet`
 - `aws_route_table.rt`, somente para subnet publica
-- `aws_route.route`, somente para subnet publica
+- `aws_route.route`, somente para subnet publica;
+- `aws_route_table_association.association`, somente para subnet publica.
+
+O modulo tambem exporta `subnet_id`, usado pelos VPC Interface Endpoints.
 
 ### Entradas
 
@@ -214,7 +225,10 @@ Arquivos principais:
 | `00_data.tf` | Busca Availability Zones disponiveis. |
 | `00_output.tf` | Exporta o ID do Internet Gateway. |
 | `01_vpc.tf` | Instancia o modulo VPC e cria o Internet Gateway. |
-| `01_subnet.tf` | Instancia quatro subnets: duas publicas e duas privadas. |
+| `01_subnet.tf` | Instancia quatro subnets: duas publicas e duas privadas, passando o Internet Gateway para as publicas. |
+| `02_sg_engress_eks.tf` | Instancia o SG de egress do EKS e as regras de DNS/HTTPS. |
+| `02_sg_ingress_interface_endpoint.tf` | Instancia o SG de ingress do Interface Endpoint e sua regra HTTPS. |
+| `03_endpoint_interface.tf` | Instancia o Interface Endpoint do ECR nas subnets privadas. |
 
 ## Ambientes
 
@@ -237,10 +251,31 @@ environment_tags = {
 
 Eles ainda nao estao conectados diretamente a uma configuracao raiz propria. A execucao ativa do projeto acontece em `live/`.
 
+## Modulos de security group e endpoint
+
+### `modules/security_group_egress`
+
+Cria um security group independente para ser usado como origem do trafego do EKS. Nao cria regras internamente.
+
+### `modules/security_group_ingress`
+
+Cria um security group independente para ser associado as ENIs de um Interface Endpoint. Nao cria regras internamente.
+
+### `modules/security_group_egress_rule.tf`
+
+Cria regras de saida do EKS para o DNS da VPC e para o Interface Endpoint via TCP/443.
+
+### `modules/security_group_ingress_rule.tf`
+
+Cria a regra de entrada TCP/443 no endpoint, referenciando o SG do EKS como origem.
+
+### `modules/endpoint_interface`
+
+Cria um VPC Interface Endpoint com service name, subnets privadas, SGs associados e DNS privado habilitado.
+
 ## Proximos passos naturais
 
-- Passar `gateway_id` para os modulos de subnet publica em `live/01_subnet.tf`.
-- Criar associacao explicita entre route table publica e subnet publica.
-- Adicionar outputs no modulo `subnet`, como subnet ID e route table ID.
 - Renomear `modules/subnet/variables..tf` para `variables.tf`.
 - Decidir se `environments/dev` e `environments/prod` vao virar roots Terraform completos ou apenas arquivos de valores.
+- Criar os endpoints adicionais necessarios para o EKS/ECR, como `ecr.api` e S3 Gateway Endpoint.
+- Associar o security group de egress aos nodes ou pods do EKS quando o cluster for criado.

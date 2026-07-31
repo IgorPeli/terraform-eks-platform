@@ -13,6 +13,7 @@ module "subnet-public-a" {
     }
 
   )
+  gateway_id = aws_internet_gateway.internet_gateway.id
 
 }
 
@@ -30,6 +31,7 @@ module "subnet-public-b" {
       Name  = "public-b"
     }
   )
+  gateway_id = aws_internet_gateway.internet_gateway.id
 
 }
 
