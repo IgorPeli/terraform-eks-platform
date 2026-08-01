@@ -15,6 +15,15 @@ O root `live` usa a região `us-east-2` e o profile `terraform-local`. Ele cria:
 
 As subnets privadas não recebem rota para NAT ou Internet Gateway. O acesso aos serviços AWS depende dos endpoints configurados e das regras de security group.
 
+Neste projeto, a subnet não possui security group próprio. Os SGs são associados às ENIs dos recursos executados nela. Para uma carga privada usando o SG restritivo do projeto, o caminho mínimo até ECR e S3 combina:
+
+- egress TCP/443 do SG cliente para o SG associado às ENIs dos Interface Endpoints;
+- ingress TCP/443 no SG dos Interface Endpoints, tendo o SG cliente como origem;
+- egress TCP/443 do SG cliente para a prefix list do Gateway Endpoint do S3;
+- associação das route tables privadas ao Gateway Endpoint do S3.
+
+As regras de SG autorizam o tráfego, enquanto as route tables determinam o caminho. Uma parte não substitui a outra.
+
 ## Estrutura
 
 ```text
@@ -45,7 +54,11 @@ terraform plan
 terraform apply
 ```
 
-Os arquivos em `environments/dev` e `environments/prod` fornecem valores de ambiente, mas a configuração raiz executada atualmente é `live`.
+As pastas `environments/dev` e `environments/prod` estão reservadas para configuração futura, mas a configuração raiz executada atualmente é `live`.
+
+## Ambientes
+
+As duas pastas contêm apenas arquivos `backend.tf` vazios. Ainda não existem `terraform.tfvars` nem roots independentes; a execução acontece em `live`.
 
 ## Contratos dos módulos
 
@@ -157,6 +170,8 @@ module "subnet-private-a" {
 
 Não cria NAT Gateway nem rotas de saída para a Internet.
 
+O arquivo de variáveis ainda se chama `variables..tf`. O Terraform o reconhece pela extensão `.tf`, mas o nome pode ser normalizado futuramente para `variables.tf`.
+
 ### `endpoint_interface`
 
 Path: [`modules/endpoint_interface`](modules/endpoint_interface)
@@ -173,6 +188,8 @@ Usar para serviços como ECR API e ECR DKR, informando subnets privadas e securi
 
 - Cria `aws_vpc_endpoint.interface` do tipo `Interface`.
 - Habilita `private_dns_enabled = true`.
+- Cria ENIs do endpoint nas subnets informadas e associa a elas os SGs recebidos em `security_group_ids`.
+- O SG pertence às ENIs do endpoint, não às subnets.
 - Não exige rotas manuais por endpoint; as ENIs são alcançadas pela rota local da VPC.
 
 #### Inputs
@@ -211,6 +228,10 @@ module "ecr_interface" {
 
 Cada instância representa um serviço. O caller precisa criar os endpoints adicionais necessários.
 
+O módulo não cria regras de SG. No escopo atual, o SG do endpoint precisa aceitar TCP/443 do SG cliente, e o SG cliente precisa permitir TCP/443 para o SG do endpoint. Os dois endpoints ECR atuais compartilham o mesmo SG.
+
+O módulo não recebe uma policy customizada. A AWS aplica a policy padrão de acesso amplo ao serviço, ainda sujeita às políticas IAM e às políticas específicas do serviço.
+
 ### `endpoint_gateway`
 
 Path: [`modules/endpoint_gateway`](modules/endpoint_gateway)
@@ -225,7 +246,7 @@ Usar principalmente para S3 ou DynamoDB. O endpoint adiciona a rota da prefix li
 
 #### Resources and behavior
 
-- Cria `aws_vpc_endpoint.s3` do tipo `Gateway`.
+- Cria `aws_vpc_endpoint.gateway_endpoint` do tipo `Gateway`.
 - Usa `route_table_ids`, não `subnet_ids`.
 - Não cria rotas `aws_route` manualmente.
 
@@ -241,13 +262,16 @@ Usar principalmente para S3 ou DynamoDB. O endpoint adiciona a rota da prefix li
 
 #### Outputs
 
-Não possui outputs.
+| Nome | Descrição | Consumidores |
+| --- | --- | --- |
+| `prefix_list_id` | ID da prefix list do serviço associada ao Gateway Endpoint. | Regra de egress TCP/443 do SG cliente. |
 
 #### Dependencies and assumptions
 
 - As route tables devem pertencer à VPC informada.
 - O serviço deve ser compatível com Gateway Endpoint.
 - A configuração atual utiliza a variável `route_tables_ids` conforme o caller.
+- O consumo de `module.s3_gateway.prefix_list_id` cria uma dependência implícita: a regra de SG aguarda o valor retornado pelo endpoint.
 
 #### Example
 
@@ -268,6 +292,10 @@ module "s3_gateway" {
 
 Não cria subnets nem route tables. O caller deve fornecê-las.
 
+A associação da route table cria o caminho até o serviço, mas os security groups dos clientes e as network ACLs ainda precisam permitir o tráfego. Um Gateway Endpoint não cria ENIs e não possui SG próprio; no escopo atual, o SG cliente libera TCP/443 diretamente para a `prefix_list_id` exportada pelo módulo.
+
+O módulo não recebe uma policy customizada para restringir o acesso ao S3, inclusive ao bucket regional usado pelo ECR para armazenar as camadas das imagens.
+
 ### `security_group_egress`
 
 Path: [`modules/security_group_egress`](modules/security_group_egress)
@@ -284,7 +312,8 @@ Associar aos workloads e referenciá-lo como origem das regras para endpoints pr
 
 - Cria `aws_security_group.security_group`.
 - Não cria regras próprias.
-- O egress padrão da AWS permanece aberto.
+- Ao criar o SG, o provider Terraform AWS remove a regra AWS padrão que permitiria todo o egress.
+- No root `live`, as regras de saída são adicionadas separadamente por `security_group_egress_rule.tf`.
 
 #### Inputs
 
@@ -307,11 +336,19 @@ Depende de uma VPC existente no caller.
 
 #### Example
 
-Uso atual: `module.sg_egress_eks_ecr` em `live/02_sg_engress_eks.tf`.
+```hcl
+module "sg_egress_eks_ecr" {
+  source      = "../modules/security_group_egress"
+  name        = "egress-eks-ecr"
+  description = "SG that allows egress to private endpoints"
+  vpc_id      = module.vpc.vpc_id
+  tags        = var.environment_tags
+}
+```
 
 #### Limitations and follow-ups
 
-O SG ainda não é associado a um cluster EKS neste projeto.
+O SG ainda não é associado a um cluster EKS neste projeto. Sem regras externas, ele não permite iniciar tráfego de saída.
 
 ### `security_group_ingress`
 
@@ -329,7 +366,9 @@ Associar aos endpoints e permitir entrada a partir do SG dos clientes.
 
 - Cria `aws_security_group.security_group`.
 - Não cria regras próprias.
-- O egress padrão permanece aberto.
+- Ao criar o SG, o provider Terraform AWS remove a regra AWS padrão que permitiria todo o egress.
+- No root `live`, existe uma regra externa de ingress TCP/443; não há regra explícita de egress para iniciar novas conexões.
+- Como security groups são stateful, respostas ao ingress permitido podem sair sem uma regra de egress equivalente.
 
 #### Inputs
 
@@ -352,7 +391,15 @@ Depende de uma VPC existente e de regras criadas pelo caller.
 
 #### Example
 
-Uso atual: `module.sg_ingress_interface` em `live/02_sg_ingress_interface_endpoint.tf`.
+```hcl
+module "sg_ingress_interface" {
+  source      = "../modules/security_group_ingress"
+  name        = "ingress-eks-ecr"
+  description = "SG that allows ingress from EKS"
+  vpc_id      = module.vpc.vpc_id
+  tags        = var.environment_tags
+}
+```
 
 #### Limitations and follow-ups
 
@@ -364,23 +411,25 @@ Path: [`modules/security_group_egress_rule.tf`](modules/security_group_egress_ru
 
 #### Purpose
 
-Cria regras de saída para um security group cliente.
+Cria as regras de saída necessárias para o security group cliente no escopo privado atual.
 
 #### Intended use
 
-Liberar DNS para o resolver da VPC e HTTPS para o SG do endpoint.
+Liberar DNS para o resolver da VPC, HTTPS para os Interface Endpoints e HTTPS para o Gateway Endpoint do S3.
 
 #### Resources and behavior
 
 - UDP/53 para `10.16.0.2`.
-- TCP/443 para o security group referenciado.
+- TCP/443 para o security group associado às ENIs dos Interface Endpoints.
+- TCP/443 para a prefix list do Gateway Endpoint.
 
 #### Inputs
 
 | Nome | Tipo | Obrigatório | Finalidade |
 | --- | --- | --- | --- |
 | `security_group_id` | `string` | sim | SG que recebe as regras. |
-| `referenced_security_group_id` | `string` | sim | SG de destino do HTTPS. |
+| `referenced_security_group_id` | `string` | sim | SG das ENIs dos Interface Endpoints, usado como destino do HTTPS. |
+| `prefix_list_id` | `string` | sim | Prefix list do Gateway Endpoint, usada como destino do HTTPS. |
 
 #### Outputs
 
@@ -392,11 +441,20 @@ Os SGs devem estar na mesma VPC ou em contexto que permita a referência entre g
 
 #### Example
 
-Uso atual: `module.sg_egress_eks_ecr_rule` em `live/02_sg_engress_eks.tf`.
+```hcl
+module "sg_egress_eks_ecr_rule" {
+  source                       = "../modules/security_group_egress_rule.tf"
+  security_group_id            = module.sg_egress_eks_ecr.sg_id
+  referenced_security_group_id = module.sg_ingress_interface.sg_id
+  prefix_list_id               = module.s3_gateway.prefix_list_id
+}
+```
 
 #### Limitations and follow-ups
 
-Não cria TCP/53 e não remove o egress padrão aberto do SG.
+Não cria TCP/53. As únicas saídas adicionadas pelo módulo são UDP/53 para `10.16.0.2`, TCP/443 para o SG referenciado e TCP/443 para a prefix list informada.
+
+As duas regras HTTPS são obrigatórias no contrato atual do módulo. Ele não permite habilitar somente Interface Endpoint ou somente Gateway Endpoint. Isso atende ao escopo atual de acesso privado ao ECR, cujas imagens também dependem do S3, mas reduz a reutilização do módulo para outros cenários.
 
 ### `security_group_ingress_rule.tf`
 
@@ -432,7 +490,13 @@ Os dois SGs devem ser compatíveis para referência entre grupos.
 
 #### Example
 
-Uso atual: `module.sg_ingress_interface_rule` em `live/02_sg_ingress_interface_endpoint.tf`.
+```hcl
+module "sg_ingress_interface_rule" {
+  source                       = "../modules/security_group_ingress_rule.tf"
+  security_group_id            = module.sg_ingress_interface.sg_id
+  referenced_security_group_id = module.sg_egress_eks_ecr.sg_id
+}
+```
 
 #### Limitations and follow-ups
 
@@ -441,3 +505,11 @@ Permite somente TCP/443.
 ## Root ativo
 
 Consulte [`live/README.md`](live/README.md) para o mapa dos arquivos, fluxo de dependências, recursos instanciados e limitações do ambiente atual.
+
+## Próximos passos
+
+- Associar o security group cliente aos nodes ou pods quando o cluster EKS for criado.
+- Avaliar TCP/53 caso o ambiente precise suportar consultas DNS por TCP.
+- Mapear os endpoints adicionais exigidos pelo EKS e pelos add-ons antes de operar sem NAT Gateway.
+- Remover valores regionais fixos dos módulos caso o projeto precise suportar outras regiões.
+- Definir se `environments/dev` e `environments/prod` serão roots completos ou apenas conjuntos de variáveis.

@@ -16,4 +16,5 @@ module "sg_egress_eks_ecr_rule" {
   source                       = "../modules/security_group_egress_rule.tf"
   referenced_security_group_id = module.sg_ingress_interface.sg_id
   security_group_id            = module.sg_egress_eks_ecr.sg_id
+  prefix_list_id               = module.s3_gateway.prefix_list_id
 }

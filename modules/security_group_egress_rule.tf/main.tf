@@ -6,10 +6,19 @@ resource "aws_vpc_security_group_egress_rule" "allow_udp_dns" {
   to_port           = 53
 }
 
-resource "aws_vpc_security_group_egress_rule" "allow_tcp_https" {
+resource "aws_vpc_security_group_egress_rule" "allow_tcp_https_interface" {
   security_group_id            = var.security_group_id
   ip_protocol                  = "tcp"
   from_port                    = 443
   to_port                      = 443
   referenced_security_group_id = var.referenced_security_group_id
+}
+
+resource "aws_vpc_security_group_egress_rule" "allow_tcp_https_gateway" {
+  security_group_id = var.security_group_id
+  ip_protocol       = "tcp"
+  from_port         = 443
+  to_port           = 443
+  prefix_list_id    = var.prefix_list_id
+
 }

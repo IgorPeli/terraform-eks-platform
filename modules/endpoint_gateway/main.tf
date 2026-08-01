@@ -1,4 +1,4 @@
-resource "aws_vpc_endpoint" "s3" {
+resource "aws_vpc_endpoint" "gateway_endpoint" {
   vpc_id            = var.vpc_id
   service_name      = var.service_name
   service_region    = var.region

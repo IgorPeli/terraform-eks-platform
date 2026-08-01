@@ -27,3 +27,4 @@ variable "tags" {
   description = "Tags of the resource"
 
 }
+
