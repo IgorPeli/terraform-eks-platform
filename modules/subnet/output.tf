@@ -3,3 +3,8 @@ output "subnet_id" {
   description = "ID of the subnet"
 
 }
+
+output "route_table_id" {
+  value = aws_route_table.rt.id
+
+}

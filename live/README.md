@@ -1,264 +1,113 @@
-# Infraestrutura ativa em `live`
+# Root Terraform ativo: `live`
 
-Esta pasta e o root Terraform ativo do projeto. E aqui que os comandos `terraform init`, `terraform plan` e `terraform apply` devem ser executados neste momento.
+Esta pasta é o root Terraform executado atualmente. Os comandos `terraform init`, `terraform validate`, `terraform plan` e `terraform apply` devem ser executados aqui.
 
-## O que esta sendo criado
+## Configuração atual
 
-A configuracao atual monta a base de rede AWS:
+- Provider AWS na região `us-east-2`, usando o profile `terraform-local`.
+- VPC `10.16.0.0/16` com DNS support e DNS hostnames habilitados.
+- Internet Gateway associado à VPC.
+- Subnets públicas A/B: `10.16.0.0/20` e `10.16.16.0/20`.
+- Subnets privadas A/B: `10.16.32.0/20` e `10.16.48.0/20`.
+- Route table própria associada a cada subnet.
+- Apenas as subnets públicas recebem `0.0.0.0/0` para o Internet Gateway.
+- Interface Endpoints `ecr.dkr` e `ecr.api` nas duas subnets privadas.
+- Gateway Endpoint do S3 associado às route tables das subnets privadas.
 
-- VPC `10.16.0.0/16`;
-- Internet Gateway conectado na VPC;
-- subnet publica A `10.16.0.0/20`;
-- subnet publica B `10.16.16.0/20`;
-- subnet privada A `10.16.32.0/20`;
-- subnet privada B `10.16.48.0/20`.
+As subnets privadas não possuem rota para NAT ou Internet Gateway. Interface Endpoints são alcançados pela rota local da VPC; o Gateway Endpoint adiciona a rota da prefix list do S3 às route tables informadas.
 
-## Fluxo dos arquivos
+## Mapa de arquivos
 
-| Arquivo | Papel |
+| Arquivo | Responsabilidade |
 | --- | --- |
-| `00_providers.tf` | Configura o provider AWS na regiao `us-east-2`. |
-| `00_variables.tf` | Declara `environment_tags`. |
-| `00_data.tf` | Busca as Availability Zones disponiveis. |
-| `00_output.tf` | Mostra o ID do Internet Gateway. |
-| `01_vpc.tf` | Cria a VPC via modulo e cria o Internet Gateway. |
-| `01_subnet.tf` | Cria as quatro subnets via modulo. |
-| `02_sg_engress_eks.tf` | Cria o SG de saida do EKS e suas regras de DNS e HTTPS. |
-| `02_sg_ingress_interface_endpoint.tf` | Cria o SG do Interface Endpoint e permite HTTPS vindo do EKS. |
-| `03_endpoint_interface.tf` | Cria o VPC Interface Endpoint do ECR nas subnets privadas. |
+| `00_providers.tf` | Provider AWS, versão `~> 6.0`, região e profile. |
+| `00_variables.tf` | Variável `environment_tags`. |
+| `00_data.tf` | Availability Zones disponíveis e região atual do provider. |
+| `00_output.tf` | IDs do Internet Gateway e da região do provider. |
+| `01_vpc.tf` | Módulo VPC e Internet Gateway. |
+| `01_subnet.tf` | Duas subnets públicas e duas privadas. |
+| `02_sg_engress_eks.tf` | SG cliente e regras de egress. |
+| `02_sg_ingress_interface_endpoint.tf` | SG das ENIs dos endpoints e regra de ingress. |
+| `03_endpoint_interface.tf` | Interface Endpoints do ECR. |
+| `03_endpoint_gateway.tf` | Gateway Endpoint do S3. |
 
-## Conexao entre recursos
+## Fluxo de dependências
 
-O modulo `vpc` exporta `module.vpc.vpc_id`.
+```text
+module.vpc
+├── aws_internet_gateway.internet_gateway
+├── module.subnet-public-a/b
+├── module.subnet-private-a/b
+├── module.sg_egress_eks_ecr
+└── module.sg_ingress_interface
+    ├── module.sg_egress_eks_ecr_rule
+    └── module.sg_ingress_interface_rule
 
-Esse ID e usado por:
+subnet-private-a/b ──┬── Interface Endpoints ECR
+                     └── Gateway Endpoint S3 via route_table_id
+```
 
-- `aws_internet_gateway.internet_gateway`;
-- todos os blocos `module "subnet-..."`.
+As referências a outputs dos módulos criam as dependências implícitas entre VPC, subnets, security groups e endpoints.
 
-As subnets publicas usam `is_public = true`, o que ativa a criacao de route table, rota publica e associacao da route table dentro do modulo `subnet`. O `gateway_id` do Internet Gateway e passado explicitamente para as subnets publicas.
+## Módulos instanciados
 
-Os security groups sao criados separadamente dos modulos de regras. Isso permite que as regras de entrada e saida referenciem os dois SGs sem criar dependencia circular entre os modulos.
+### VPC e subnets
+
+- `module.vpc` cria a VPC.
+- `module.subnet-public-a` e `module.subnet-public-b` criam subnets públicas com rota para o IGW.
+- `module.subnet-private-a` e `module.subnet-private-b` criam subnets privadas com route tables próprias, sem rota default para a Internet.
+
+Cada módulo de subnet exporta `subnet_id` e `route_table_id`.
+
+### Security groups
+
+`module.sg_egress_eks_ecr` representa o SG dos clientes. A regra de egress permite UDP/53 para `10.16.0.2` e TCP/443 para o SG dos endpoints.
+
+`module.sg_ingress_interface` representa o SG das ENIs dos endpoints. A regra de ingress permite TCP/443 originado pelo SG dos clientes.
+
+O egress padrão dos security groups permanece aberto porque os módulos não removem a regra padrão da AWS.
+
+### Interface Endpoints
+
+`module.ecr_interface` cria:
+
+```text
+com.amazonaws.us-east-2.ecr.dkr
+```
+
+`module.api_interface` cria:
+
+```text
+com.amazonaws.us-east-2.ecr.api
+```
+
+Ambos usam as duas subnets privadas, o SG `sg_ingress_interface` e DNS privado habilitado.
+
+### Gateway Endpoint
+
+`module.s3_gateway` cria um Gateway Endpoint para:
+
+```text
+com.amazonaws.us-east-2.s3
+```
+
+Ele recebe os `route_table_id` das subnets privadas. A AWS/Terraform gerencia a rota baseada na prefix list do S3; não são usadas rotas manuais por DNS ou IP.
 
 ## Comandos
 
-```powershell
-terraform fmt -recursive
+```bash
 terraform init
+terraform fmt -recursive
 terraform validate
 terraform plan
+terraform apply
 ```
 
-## Modulos de rede adicionados
-
-### `modules/security_group_egress`
-
-#### Purpose
-
-Cria o security group usado como origem do trafego dos nodes/pods do EKS.
-
-#### Intended use
-
-Associe-o aos nodes/pods do EKS e use-o como origem para endpoints privados.
-
-#### Resources and behavior
-
-- Cria `aws_security_group.security_group`.
-- Nao cria regras internamente.
-- O egress padrao permanece aberto porque o SG nao usa `egress = []`.
-
-#### Inputs
-
-| Nome | Tipo | Obrigatorio | Finalidade |
-| --- | --- | --- | --- |
-| `name` | `string` | sim | Nome do SG. |
-| `description` | `string` | sim | Descricao do SG. |
-| `vpc_id` | `string` | sim | VPC do SG. |
-| `tags` | `map(string)` | sim | Tags adicionais. |
-
-#### Outputs
-
-| Nome | Descricao | Consumidores |
-| --- | --- | --- |
-| `sg_id` | ID do SG criado. | Modulos de regras e EKS futuro. |
-
-#### Dependencies and assumptions
-
-Depende da VPC criada pelo modulo `vpc`.
-
-#### Example
-
-Uso atual: `module "sg_egress_eks_ecr"` neste root.
-
-#### Limitations and follow-ups
-
-Ainda nao esta associado a um EKS real. O caller deve associar o SG aos nodes/pods e criar as regras.
-
-### `modules/security_group_ingress`
-
-#### Purpose
-
-Cria o security group associado as ENIs do Interface Endpoint.
-
-#### Intended use
-
-Associe-o ao endpoint e controle a entrada TCP/443 a partir do SG do EKS.
-
-#### Resources and behavior
-
-- Cria `aws_security_group.security_group`.
-- Nao cria regras internamente.
-- O egress padrao permanece aberto.
-
-#### Inputs
-
-| Nome | Tipo | Obrigatorio | Finalidade |
-| --- | --- | --- | --- |
-| `name` | `string` | sim | Nome do SG. |
-| `description` | `string` | sim | Descricao do SG. |
-| `vpc_id` | `string` | sim | VPC do SG. |
-| `tags` | `map(string)` | sim | Tags adicionais. |
-
-#### Outputs
-
-| Nome | Descricao | Consumidores |
-| --- | --- | --- |
-| `sg_id` | ID do SG criado. | Endpoint e regra de ingress. |
-
-#### Dependencies and assumptions
-
-Depende da VPC criada pelo modulo `vpc`.
-
-#### Example
-
-Uso atual: `module "sg_ingress_interface"` neste root.
-
-#### Limitations and follow-ups
-
-O modulo nao associa o SG a um endpoint e nao cria regras.
-
-### `modules/security_group_egress_rule.tf`
-
-#### Purpose
-
-Cria as regras de saida do SG do EKS.
-
-#### Intended use
-
-Use-o para liberar DNS da VPC e HTTPS para um Interface Endpoint.
-
-#### Resources and behavior
-
-- UDP/53 para o resolver DNS da VPC `10.16.0.2`;
-- TCP/443 para o SG do Interface Endpoint.
-
-#### Inputs
-
-| Nome | Tipo | Obrigatorio | Finalidade |
-| --- | --- | --- | --- |
-| `security_group_id` | `string` | sim | SG que recebe as regras. |
-| `referenced_security_group_id` | `string` | sim | SG de destino do HTTPS. |
-
-#### Outputs
-
-Nao possui outputs.
-
-#### Dependencies and assumptions
-
-Depende dos dois SGs existirem. As referencias aos outputs criam dependencias implicitas sem ciclo.
-
-#### Example
-
-Uso atual: `module "sg_egress_eks_ecr_rule"` neste root.
-
-#### Limitations and follow-ups
-
-TCP/53 nao esta incluido atualmente.
-
-### `modules/security_group_ingress_rule.tf`
-
-#### Purpose
-
-Cria a regra de entrada TCP/443 no SG do endpoint.
-
-#### Intended use
-
-Autoriza o SG do EKS como origem do trafego para o endpoint.
-
-#### Resources and behavior
-
-- `security_group_id` e o SG de destino.
-- `referenced_security_group_id` e o SG de origem autorizado.
-
-#### Inputs
-
-| Nome | Tipo | Obrigatorio | Finalidade |
-| --- | --- | --- | --- |
-| `security_group_id` | `string` | sim | SG do endpoint. |
-| `referenced_security_group_id` | `string` | sim | SG do EKS. |
-
-#### Outputs
-
-Nao possui outputs.
-
-#### Dependencies and assumptions
-
-Depende dos dois SGs existirem e da mesma VPC permitir a referencia entre eles.
-
-#### Example
-
-Uso atual: `module "sg_ingress_interface_rule"` neste root.
-
-#### Limitations and follow-ups
-
-A regra cobre somente TCP/443.
-
-### `modules/endpoint_interface`
-
-#### Purpose
-
-Cria um VPC Interface Endpoint para expor um servico AWS por ENIs privadas.
-
-#### Intended use
-
-Use-o com subnets privadas e um SG que permita o acesso dos clientes.
-
-#### Resources and behavior
-
-- Cria `aws_vpc_endpoint.interface` do tipo `Interface`.
-- Associa os SGs e subnets informados.
-- Habilita `private_dns_enabled = true`.
-
-#### Inputs
-
-| Nome | Tipo | Obrigatorio | Finalidade |
-| --- | --- | --- | --- |
-| `vpc_id` | `string` | sim | VPC do endpoint. |
-| `service_name` | `string` | sim | Nome de um servico AWS. |
-| `security_group_ids` | `list(string)` | sim | SGs das ENIs. |
-| `subnet_ids` | `list(string)` | sim | Subnets das ENIs. |
-| `tags` | `map(string)` | sim | Tags adicionais. |
-
-#### Outputs
-
-Nao possui outputs atualmente.
-
-#### Dependencies and assumptions
-
-Depende da VPC, das subnets privadas e do SG do endpoint.
-
-#### Example
-
-```hcl
-module "ecr_interface" {
-  source             = "../modules/endpoint_interface"
-  vpc_id             = module.vpc.vpc_id
-  security_group_ids = [module.sg_ingress_interface.sg_id]
-  service_name       = "com.amazonaws.us-east-2.ecr.dkr"
-  subnet_ids         = [module.subnet-private-b.subnet_id, module.subnet-private-a.subnet_id]
-}
-```
-
-#### Limitations and follow-ups
-
-Cada instancia representa um servico. Atualmente o root cria somente `ecr.dkr`; endpoints adicionais, como `ecr.api` e S3 Gateway, sao trabalho futuro.
+## Limitações atuais
+
+- O cluster EKS ainda não está definido neste root.
+- O SG de egress ainda não está associado a nodes ou pods reais.
+- O egress padrão dos SGs permanece aberto.
+- A regra de DNS configurada pelo módulo é UDP/53; TCP/53 não está incluído.
+- A região está declarada no provider, mas alguns módulos ainda possuem valores regionais fixos.
+- Os arquivos de `environments/dev` e `environments/prod` ainda não são roots Terraform independentes.

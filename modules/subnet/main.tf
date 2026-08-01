@@ -13,14 +13,13 @@ resource "aws_subnet" "subnet" {
 
 
 resource "aws_route_table" "rt" {
-  count  = var.is_public ? 1 : 0
   vpc_id = var.vpc_id
 
 }
 
 resource "aws_route" "route" {
   count                  = var.is_public ? 1 : 0
-  route_table_id         = aws_route_table.rt[0].id
+  route_table_id         = aws_route_table.rt.id
   region                 = "us-east-2"
   gateway_id             = var.gateway_id
   destination_cidr_block = "0.0.0.0/0"
@@ -28,7 +27,6 @@ resource "aws_route" "route" {
 }
 
 resource "aws_route_table_association" "association" {
-  count          = var.is_public ? 1 : 0
   subnet_id      = aws_subnet.subnet.id
-  route_table_id = aws_route_table.rt[0].id
+  route_table_id = aws_route_table.rt.id
 }
