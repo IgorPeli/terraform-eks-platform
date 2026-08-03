@@ -1,6 +1,6 @@
 module "sg_egress_eks_ecr" {
   name        = "egress-eks-ecr"
-  description = "SG that allow egress to Interface Endpoint ECR"
+  description = "SG that allow egress Nat gateway"
   source      = "../modules/security_group_egress"
   vpc_id      = module.vpc.vpc_id
   tags = merge(
@@ -12,9 +12,50 @@ module "sg_egress_eks_ecr" {
   })
 }
 
-module "sg_egress_eks_ecr_rule" {
-  source                       = "../modules/security_group_egress_rule.tf"
-  referenced_security_group_id = module.sg_ingress_interface.sg_id
-  security_group_id            = module.sg_egress_eks_ecr.sg_id
-  prefix_list_id               = module.s3_gateway.prefix_list_id
+module "egress_dns_udp" {
+  source = "../modules/security_group_egress_rule.tf"
+
+  security_group_id = module.sg_egress_eks.sg_id
+  description       = "DNS UDP to VPC resolver"
+  ip_protocol       = "udp"
+  from_port         = 53
+  to_port           = 53
+  destination_type  = "cidr_ipv4"
+  destination       = "10.16.0.2/32"
+}
+
+module "egress_dns_tcp" {
+  source = "../modules/security_group_egress_rule.tf"
+
+  security_group_id = module.sg_egress_eks.sg_id
+  description       = "DNS TCP to VPC resolver"
+  ip_protocol       = "tcp"
+  from_port         = 53
+  to_port           = 53
+  destination_type  = "cidr_ipv4"
+  destination       = "10.16.0.2/32"
+}
+
+module "egress_https_internet" {
+  source = "../modules/security_group_egress_rule.tf"
+
+  security_group_id = module.sg_egress_eks.sg_id
+  description       = "HTTPS internet access through NAT"
+  ip_protocol       = "tcp"
+  from_port         = 443
+  to_port           = 443
+  destination_type  = "cidr_ipv4"
+  destination       = "0.0.0.0/0"
+}
+
+module "egress_s3_gateway" {
+  source = "../modules/security_group_egress_rule.tf"
+
+  security_group_id = module.sg_egress_eks.sg_id
+  description       = "HTTPS to S3 Gateway Endpoint"
+  ip_protocol       = "tcp"
+  from_port         = 443
+  to_port           = 443
+  destination_type  = "prefix_list"
+  destination       = module.s3_gateway.prefix_list_id
 }

@@ -41,6 +41,7 @@ module "subnet-private-a" {
   availability_zone = data.aws_availability_zones.available.names[0]
   cidr_block        = "10.16.32.0/20"
   depends_on        = [module.vpc]
+  nat_gateway       = module.nat_gateway.nat_id
   tags = merge(
     var.environment_tags,
     {
@@ -55,6 +56,7 @@ module "subnet-private-a" {
 module "subnet-private-b" {
   source            = "../modules/subnet"
   vpc_id            = module.vpc.vpc_id
+  nat_gateway       = module.nat_gateway.nat_id
   availability_zone = data.aws_availability_zones.available.names[1]
   cidr_block        = "10.16.48.0/20"
   depends_on        = [module.vpc]

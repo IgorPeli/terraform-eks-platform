@@ -1,24 +1,25 @@
-resource "aws_vpc_security_group_egress_rule" "allow_udp_dns" {
+resource "aws_vpc_security_group_egress_rule" "rule" {
   security_group_id = var.security_group_id
-  ip_protocol       = "udp"
-  cidr_ipv4         = "10.16.0.2/32"
-  from_port         = 53
-  to_port           = 53
-}
+  description       = var.description
+  ip_protocol       = var.ip_protocol
+  from_port         = var.from_port
+  to_port           = var.to_port
 
-resource "aws_vpc_security_group_egress_rule" "allow_tcp_https_interface" {
-  security_group_id            = var.security_group_id
-  ip_protocol                  = "tcp"
-  from_port                    = 443
-  to_port                      = 443
-  referenced_security_group_id = var.referenced_security_group_id
-}
+  cidr_ipv4 = (
+    var.destination_type == "cidr_ipv4"
+    ? var.destination
+    : null
+  )
 
-resource "aws_vpc_security_group_egress_rule" "allow_tcp_https_gateway" {
-  security_group_id = var.security_group_id
-  ip_protocol       = "tcp"
-  from_port         = 443
-  to_port           = 443
-  prefix_list_id    = var.prefix_list_id
+  prefix_list_id = (
+    var.destination_type == "prefix_list"
+    ? var.destination
+    : null
+  )
 
+  referenced_security_group_id = (
+    var.destination_type == "security_group"
+    ? var.destination
+    : null
+  )
 }

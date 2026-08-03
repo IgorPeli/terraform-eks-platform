@@ -17,7 +17,7 @@ resource "aws_route_table" "rt" {
 
 }
 
-resource "aws_route" "route" {
+resource "aws_route" "public_route" {
   count                  = var.is_public ? 1 : 0
   route_table_id         = aws_route_table.rt.id
   region                 = "us-east-2"
@@ -29,4 +29,13 @@ resource "aws_route" "route" {
 resource "aws_route_table_association" "association" {
   subnet_id      = aws_subnet.subnet.id
   route_table_id = aws_route_table.rt.id
+}
+
+resource "aws_route" "private_route" {
+  count                  = var.is_public ? 0 : 1
+  route_table_id         = aws_route_table.rt.id
+  region                 = "us-east-2"
+  nat_gateway_id         = var.nat_gateway
+  destination_cidr_block = "0.0.0.0/0"
+
 }

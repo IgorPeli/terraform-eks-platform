@@ -34,3 +34,9 @@ variable "gateway_id" {
   default     = ""
 
 }
+
+variable "nat_gateway" {
+  type        = string
+  description = "NAT Gateway to be associated"
+  default     = ""
+}

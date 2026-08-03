@@ -8,21 +8,26 @@ O root `live` usa a região `us-east-2` e o profile `terraform-local`. Ele cria:
 
 - uma VPC `10.16.0.0/16` com DNS da VPC habilitado;
 - duas subnets públicas e duas privadas, distribuídas nas duas primeiras Availability Zones disponíveis;
-- route table própria para cada subnet; apenas as públicas recebem rota `0.0.0.0/0` para o Internet Gateway;
-- security groups separados para clientes EKS e ENIs dos endpoints;
-- Interface Endpoints para `ecr.dkr` e `ecr.api` nas subnets privadas;
-- Gateway Endpoint para S3 associado às route tables privadas.
+- route table própria para cada subnet;
+- rota `0.0.0.0/0` das subnets públicas para o Internet Gateway;
+- rota `0.0.0.0/0` das subnets privadas para um NAT Gateway regional;
+- um NAT Gateway público em modo regional, associado diretamente à VPC;
+- um Gateway Endpoint do S3 associado às route tables privadas.
 
-As subnets privadas não recebem rota para NAT ou Internet Gateway. O acesso aos serviços AWS depende dos endpoints configurados e das regras de security group.
+O NAT Gateway regional fornece um único ID para as route tables privadas e expande a cobertura entre Availability Zones conforme a presença de workloads. Diferentemente do NAT Gateway zonal, ele não é criado dentro de uma subnet pública. O Internet Gateway e o NAT regional pertencem à mesma VPC; a AWS gerencia a route table própria do NAT com o caminho até o Internet Gateway.
 
-Neste projeto, a subnet não possui security group próprio. Os SGs são associados às ENIs dos recursos executados nela. Para uma carga privada usando o SG restritivo do projeto, o caminho mínimo até ECR e S3 combina:
+O root ativo deixa de instanciar os Interface Endpoints do ECR. O tráfego externo geral de workloads privados, inclusive o acesso do Argo CD ao GitHub, usa a rota default para o NAT Gateway. O tráfego destinado ao S3 usa a rota mais específica, baseada na prefix list do Gateway Endpoint, e evita o processamento pelo NAT. Security groups e network ACLs continuam responsáveis por autorizar o tráfego; a existência da rota não substitui essas permissões.
 
-- egress TCP/443 do SG cliente para o SG associado às ENIs dos Interface Endpoints;
-- ingress TCP/443 no SG dos Interface Endpoints, tendo o SG cliente como origem;
-- egress TCP/443 do SG cliente para a prefix list do Gateway Endpoint do S3;
-- associação das route tables privadas ao Gateway Endpoint do S3.
+### Decisão sobre VPC Endpoints
 
-As regras de SG autorizam o tráfego, enquanto as route tables determinam o caminho. Uma parte não substitui a outra.
+A arquitetura foi simplificada para usar o NAT Gateway como saída geral e evitar a manutenção de Interface Endpoints específicos para cada serviço consumido pelo EKS, pelos add-ons e pelo Argo CD. A redução de custos vem da retirada dos Interface Endpoints, cobrados por hora em cada Availability Zone e pelo volume processado. O NAT Gateway também possui cobrança por hora/AZ e por volume; portanto, a economia efetiva depende do perfil de tráfego e deve ser acompanhada.
+
+O Gateway Endpoint do S3 foi mantido porque não possui cobrança adicional e evita a cobrança de processamento do NAT para tráfego destinado ao S3. Essa combinação mantém o egress genérico pelo NAT sem abrir mão da rota gratuita e específica para S3. Consulte [AWS PrivateLink pricing behavior](https://docs.aws.amazon.com/vpc/latest/privatelink/privatelink-access-aws-services.html), [Gateway Endpoints](https://docs.aws.amazon.com/vpc/latest/privatelink/gateway-endpoints.html) e [Amazon VPC pricing](https://aws.amazon.com/vpc/pricing/).
+
+O módulo `endpoint_gateway` integra a arquitetura ativa por meio do caller do S3. O módulo `endpoint_interface` permanece no repositório como componente reutilizável, mas não é instanciado; ele pode voltar a ser usado se houver requisito de conectividade privada, restrição de egress, compliance ou vantagem econômica comprovada.
+
+> [!warning]
+> O caller de egress já declara DNS UDP/TCP, HTTPS público e HTTPS para a prefix list do S3. Porém, suas quatro instâncias referenciam `module.sg_egress_eks.sg_id`, enquanto o SG declarado se chama `module.sg_egress_eks_ecr`. Essa referência precisa ser corrigida antes que a configuração ativa possa ser validada e aplicada.
 
 ## Estrutura
 
@@ -35,6 +40,7 @@ As regras de SG autorizam o tráfego, enquanto as route tables determinam o cami
 └── modules/
     ├── endpoint_gateway/
     ├── endpoint_interface/
+    ├── nat_gateway/
     ├── security_group_egress/
     ├── security_group_egress_rule.tf/
     ├── security_group_ingress/
@@ -117,18 +123,19 @@ Path: [`modules/subnet`](modules/subnet)
 
 #### Purpose
 
-Cria uma subnet, uma route table dedicada e sua associação.
+Cria uma subnet, uma route table dedicada, sua associação e a rota default correspondente ao tipo da subnet.
 
 #### Intended use
 
-Usar para subnets públicas ou privadas. A diferença é que somente subnets públicas recebem rota para o Internet Gateway.
+Usar para subnets públicas ou privadas. Subnets públicas recebem rota para o Internet Gateway; subnets privadas recebem rota para o NAT Gateway informado pelo caller.
 
 #### Resources and behavior
 
 - Cria `aws_subnet.subnet`.
 - Cria `aws_route_table.rt` e `aws_route_table_association.association` para toda subnet.
-- Cria `aws_route.route` somente quando `is_public = true`.
-- Subnets privadas ficam sem rota default para Internet/NAT, mantendo a rota local da VPC.
+- Cria `aws_route.public_route` quando `is_public = true`, usando `gateway_id` como destino de `0.0.0.0/0`.
+- Cria `aws_route.private_route` quando `is_public = false`, usando `nat_gateway` como destino de `0.0.0.0/0`.
+- Cada instância recebe apenas uma das duas rotas default.
 
 #### Inputs
 
@@ -140,18 +147,21 @@ Usar para subnets públicas ou privadas. A diferença é que somente subnets pú
 | `availability_zone` | `string` | sim | Availability Zone. |
 | `is_public` | `bool` | não | Cria rota para o IGW quando `true`; padrão `false`. |
 | `gateway_id` | `string` | não | ID do IGW para subnets públicas; padrão vazio. |
+| `nat_gateway` | `string` | não | ID do NAT Gateway para subnets privadas; padrão vazio. |
 
 #### Outputs
 
 | Nome | Descrição | Consumidores |
 | --- | --- | --- |
-| `subnet_id` | ID da subnet. | Interface Endpoints. |
-| `route_table_id` | ID da route table associada. | Gateway Endpoint. |
+| `subnet_id` | ID da subnet. | Recursos que precisam ser posicionados na subnet. |
+| `route_table_id` | ID da route table associada. | Rotas e associações adicionais opcionais. |
 
 #### Dependencies and assumptions
 
 - A VPC deve existir no caller.
 - Para uma subnet pública, o IGW deve existir e seu ID deve ser informado.
+- Para uma subnet privada, o NAT Gateway deve existir e seu ID deve ser informado.
+- A referência a `module.nat_gateway.nat_id` cria dependência implícita entre a subnet privada e o NAT regional.
 
 #### Example
 
@@ -161,16 +171,72 @@ module "subnet-private-a" {
   vpc_id            = module.vpc.vpc_id
   availability_zone = data.aws_availability_zones.available.names[0]
   cidr_block        = "10.16.32.0/20"
-  is_public         = false
+  nat_gateway       = module.nat_gateway.nat_id
   tags              = var.environment_tags
 }
 ```
 
 #### Limitations and follow-ups
 
-Não cria NAT Gateway nem rotas de saída para a Internet.
+Não cria o Internet Gateway nem o NAT Gateway; apenas referencia o destino apropriado fornecido pelo caller. Como `gateway_id` e `nat_gateway` possuem padrão vazio, o caller precisa fornecer o ID compatível com o tipo da subnet para evitar uma rota inválida.
 
 O arquivo de variáveis ainda se chama `variables..tf`. O Terraform o reconhece pela extensão `.tf`, mas o nome pode ser normalizado futuramente para `variables.tf`.
+
+### `nat_gateway`
+
+Path: [`modules/nat_gateway`](modules/nat_gateway)
+
+#### Purpose
+
+Cria um NAT Gateway público em modo regional para a saída de recursos posicionados em subnets privadas.
+
+#### Intended use
+
+Usar quando workloads privados precisam iniciar conexões para a Internet ou para endpoints públicos, como o GitHub consumido pelo Argo CD, sem expor esses workloads a conexões de entrada não solicitadas.
+
+#### Resources and behavior
+
+- Cria `aws_nat_gateway.nat_gateway`.
+- Usa `availability_mode = "regional"` e `connectivity_type = "public"`.
+- Associa o NAT diretamente à VPC por meio de `vpc_id`.
+- Não recebe `subnet_id` nem Elastic IP definido pelo caller no modo automático atual.
+- Expõe um único ID regional que pode ser usado pelas route tables privadas de diferentes Availability Zones.
+
+#### Inputs
+
+| Nome | Tipo | Obrigatório | Finalidade |
+| --- | --- | --- | --- |
+| `vpc_id` | `string` | sim | VPC na qual o NAT Gateway regional será criado. |
+| `tags` | `map(string)` | sim | Tags adicionais aplicadas ao NAT Gateway. |
+
+#### Outputs
+
+| Nome | Descrição | Consumidores |
+| --- | --- | --- |
+| `nat_id` | ID do NAT Gateway regional. | Módulos de subnet privada no root `live`. |
+
+#### Dependencies and assumptions
+
+- Requer uma VPC existente e um Internet Gateway associado a ela para saída pública.
+- O caller `live/01_nat.tf` declara dependência explícita do Internet Gateway para ordenar a criação.
+- O provider AWS deve suportar NAT Gateway com disponibilidade regional.
+- A AWS gerencia a expansão automática entre AZs e a route table própria do NAT regional.
+
+#### Example
+
+```hcl
+module "nat_gateway" {
+  source = "../modules/nat_gateway"
+  vpc_id = module.vpc.vpc_id
+  tags   = var.environment_tags
+
+  depends_on = [aws_internet_gateway.internet_gateway]
+}
+```
+
+#### Limitations and follow-ups
+
+O módulo fixa os modos regional, público e automático. Não oferece variáveis para NAT zonal, NAT privado, endereços escolhidos pelo caller ou modo regional manual. As regras de security group, network ACL e as rotas das subnets privadas permanecem sob responsabilidade dos respectivos módulos e callers. A tag interna `Purpose = "eks-interface-endpoints"` não representa a finalidade atual do NAT e deve ser revisada futuramente.
 
 ### `endpoint_interface`
 
@@ -182,7 +248,7 @@ Cria um VPC Interface Endpoint com ENIs privadas.
 
 #### Intended use
 
-Usar para serviços como ECR API e ECR DKR, informando subnets privadas e security groups.
+Usar como opção reutilizável para serviços como ECR API e ECR DKR quando houver requisito de acesso privado sem passagem pelo NAT Gateway. O módulo permanece disponível, mas não integra a arquitetura ativa do root `live`.
 
 #### Resources and behavior
 
@@ -226,11 +292,13 @@ module "ecr_interface" {
 
 #### Limitations and follow-ups
 
-Cada instância representa um serviço. O caller precisa criar os endpoints adicionais necessários.
+Cada instância representa um serviço. O caller precisa criar os endpoints necessários e avaliar o custo por endpoint/AZ e por volume processado.
 
-O módulo não cria regras de SG. No escopo atual, o SG do endpoint precisa aceitar TCP/443 do SG cliente, e o SG cliente precisa permitir TCP/443 para o SG do endpoint. Os dois endpoints ECR atuais compartilham o mesmo SG.
+O módulo não cria regras de SG. Quando utilizado, o SG do endpoint precisa aceitar TCP/443 do SG cliente, e o SG cliente precisa permitir TCP/443 para o SG do endpoint.
 
 O módulo não recebe uma policy customizada. A AWS aplica a policy padrão de acesso amplo ao serviço, ainda sujeita às políticas IAM e às políticas específicas do serviço.
+
+Os antigos callers de `ecr.api` e `ecr.dkr` foram retirados do root `live` na migração para NAT Gateway regional. Reintroduzir o módulo exige restaurar também SGs, regras de tráfego e subnets compatíveis.
 
 ### `endpoint_gateway`
 
@@ -242,7 +310,7 @@ Cria um VPC Gateway Endpoint e associa-o a route tables.
 
 #### Intended use
 
-Usar principalmente para S3 ou DynamoDB. O endpoint adiciona a rota da prefix list do serviço às route tables informadas.
+Usar principalmente para S3 ou DynamoDB quando for desejável manter esse tráfego fora do NAT Gateway. O módulo adiciona a rota da prefix list do serviço às route tables informadas. No root `live`, ele é instanciado para o S3 como parte da otimização de custos da arquitetura ativa.
 
 #### Resources and behavior
 
@@ -264,14 +332,14 @@ Usar principalmente para S3 ou DynamoDB. O endpoint adiciona a rota da prefix li
 
 | Nome | Descrição | Consumidores |
 | --- | --- | --- |
-| `prefix_list_id` | ID da prefix list do serviço associada ao Gateway Endpoint. | Regra de egress TCP/443 do SG cliente. |
+| `prefix_list_id` | ID da prefix list do serviço associada ao Gateway Endpoint. | Regra `egress_s3_gateway` no root `live`. |
 
 #### Dependencies and assumptions
 
 - As route tables devem pertencer à VPC informada.
 - O serviço deve ser compatível com Gateway Endpoint.
-- A configuração atual utiliza a variável `route_tables_ids` conforme o caller.
-- O consumo de `module.s3_gateway.prefix_list_id` cria uma dependência implícita: a regra de SG aguarda o valor retornado pelo endpoint.
+- O caller deve fornecer `route_tables_ids` explicitamente.
+- Quando um caller consome `prefix_list_id`, essa referência cria uma dependência implícita em relação ao endpoint.
 
 #### Example
 
@@ -292,9 +360,11 @@ module "s3_gateway" {
 
 Não cria subnets nem route tables. O caller deve fornecê-las.
 
-A associação da route table cria o caminho até o serviço, mas os security groups dos clientes e as network ACLs ainda precisam permitir o tráfego. Um Gateway Endpoint não cria ENIs e não possui SG próprio; no escopo atual, o SG cliente libera TCP/443 diretamente para a `prefix_list_id` exportada pelo módulo.
+A associação da route table cria o caminho até o serviço, mas os security groups dos clientes e as network ACLs ainda precisam permitir o tráfego. Um Gateway Endpoint não cria ENIs e não possui SG próprio; o caller pode liberar TCP/443 diretamente para a `prefix_list_id` exportada pelo módulo.
 
 O módulo não recebe uma policy customizada para restringir o acesso ao S3, inclusive ao bucket regional usado pelo ECR para armazenar as camadas das imagens.
+
+O caller ativo associa o endpoint S3 às duas route tables privadas. A rota baseada na prefix list é mais específica que `0.0.0.0/0`, por isso o tráfego S3 usa o Gateway Endpoint enquanto os demais destinos continuam usando o NAT regional.
 
 ### `security_group_egress`
 
@@ -306,14 +376,14 @@ Cria um security group destinado aos clientes, como nodes ou pods do EKS.
 
 #### Intended use
 
-Associar aos workloads e referenciá-lo como origem das regras para endpoints privados.
+Associar aos workloads que precisam de regras de saída explícitas. O módulo pode ser combinado tanto com regras para destinos públicos via NAT quanto com regras para endpoints privados.
 
 #### Resources and behavior
 
 - Cria `aws_security_group.security_group`.
 - Não cria regras próprias.
 - Ao criar o SG, o provider Terraform AWS remove a regra AWS padrão que permitiria todo o egress.
-- No root `live`, as regras de saída são adicionadas separadamente por `security_group_egress_rule.tf`.
+- As regras de saída devem ser adicionadas separadamente pelo caller.
 
 #### Inputs
 
@@ -348,7 +418,7 @@ module "sg_egress_eks_ecr" {
 
 #### Limitations and follow-ups
 
-O SG ainda não é associado a um cluster EKS neste projeto. Sem regras externas, ele não permite iniciar tráfego de saída.
+O SG ainda não é associado a um cluster EKS neste projeto. Sem regras externas, ele não permite iniciar tráfego de saída. O root ativo instancia regras separadas para DNS UDP/TCP, HTTPS público e HTTPS para a prefix list do S3.
 
 ### `security_group_ingress`
 
@@ -360,14 +430,14 @@ Cria o security group das ENIs dos Interface Endpoints.
 
 #### Intended use
 
-Associar aos endpoints e permitir entrada a partir do SG dos clientes.
+Associar a Interface Endpoints quando os módulos de conectividade privada forem reativados e permitir entrada a partir do SG dos clientes. Não é necessário para o NAT Gateway regional.
 
 #### Resources and behavior
 
 - Cria `aws_security_group.security_group`.
 - Não cria regras próprias.
 - Ao criar o SG, o provider Terraform AWS remove a regra AWS padrão que permitiria todo o egress.
-- No root `live`, existe uma regra externa de ingress TCP/443; não há regra explícita de egress para iniciar novas conexões.
+- Quando instanciado, exige uma regra externa de ingress TCP/443; não cria egress para iniciar novas conexões.
 - Como security groups são stateful, respostas ao ingress permitido podem sair sem uma regra de egress equivalente.
 
 #### Inputs
@@ -403,7 +473,7 @@ module "sg_ingress_interface" {
 
 #### Limitations and follow-ups
 
-Não associa o SG aos endpoints automaticamente.
+Não associa o SG aos endpoints automaticamente. O root `live` não instancia este módulo porque não possui Interface Endpoints ativos.
 
 ### `security_group_egress_rule.tf`
 
@@ -411,25 +481,31 @@ Path: [`modules/security_group_egress_rule.tf`](modules/security_group_egress_ru
 
 #### Purpose
 
-Cria as regras de saída necessárias para o security group cliente no escopo privado atual.
+Cria uma regra de egress configurável para um security group.
 
 #### Intended use
 
-Liberar DNS para o resolver da VPC, HTTPS para os Interface Endpoints e HTTPS para o Gateway Endpoint do S3.
+Instanciar uma vez para cada combinação de protocolo, portas e destino necessária. O destino pode ser um CIDR IPv4, uma prefix list ou outro security group.
 
 #### Resources and behavior
 
-- UDP/53 para `10.16.0.2`.
-- TCP/443 para o security group associado às ENIs dos Interface Endpoints.
-- TCP/443 para a prefix list do Gateway Endpoint.
+- Cria um único `aws_vpc_security_group_egress_rule.rule` por instância do módulo.
+- Usa `destination_type` para selecionar exatamente um entre `cidr_ipv4`, `prefix_list_id` e `referenced_security_group_id`.
+- Atribui `destination` ao campo selecionado e define os outros dois como `null`.
+- Valida `destination_type` contra `cidr_ipv4`, `prefix_list` e `security_group`.
+- No root `live`, quatro instâncias representam DNS UDP, DNS TCP, HTTPS público e HTTPS para o S3 Gateway Endpoint.
 
 #### Inputs
 
 | Nome | Tipo | Obrigatório | Finalidade |
 | --- | --- | --- | --- |
 | `security_group_id` | `string` | sim | SG que recebe as regras. |
-| `referenced_security_group_id` | `string` | sim | SG das ENIs dos Interface Endpoints, usado como destino do HTTPS. |
-| `prefix_list_id` | `string` | sim | Prefix list do Gateway Endpoint, usada como destino do HTTPS. |
+| `description` | `string` | não | Descrição da regra; padrão `null`. |
+| `ip_protocol` | `string` | sim | Protocolo, como `tcp` ou `udp`. |
+| `from_port` | `number` | sim | Porta inicial. |
+| `to_port` | `number` | sim | Porta final. |
+| `destination_type` | `string` | sim | Seleciona `cidr_ipv4`, `prefix_list` ou `security_group`. |
+| `destination` | `string` | sim | CIDR, ID de prefix list ou ID de SG, conforme o tipo escolhido. |
 
 #### Outputs
 
@@ -437,24 +513,32 @@ Não possui outputs.
 
 #### Dependencies and assumptions
 
-Os SGs devem estar na mesma VPC ou em contexto que permita a referência entre grupos.
+- O caller deve fornecer um destino compatível com `destination_type`.
+- Para `security_group`, os grupos precisam admitir referência entre si.
+- Para `prefix_list`, o ID precisa existir na região e ser válido para o serviço esperado.
+- O módulo não verifica semanticamente se `destination` corresponde ao tipo selecionado; essa validação final cabe ao provider AWS.
 
 #### Example
 
 ```hcl
-module "sg_egress_eks_ecr_rule" {
-  source                       = "../modules/security_group_egress_rule.tf"
-  security_group_id            = module.sg_egress_eks_ecr.sg_id
-  referenced_security_group_id = module.sg_ingress_interface.sg_id
-  prefix_list_id               = module.s3_gateway.prefix_list_id
+module "egress_s3_gateway" {
+  source = "../modules/security_group_egress_rule.tf"
+
+  security_group_id = module.sg_egress_eks_ecr.sg_id
+  description       = "HTTPS to S3 Gateway Endpoint"
+  ip_protocol       = "tcp"
+  from_port         = 443
+  to_port           = 443
+  destination_type  = "prefix_list"
+  destination       = module.s3_gateway.prefix_list_id
 }
 ```
 
 #### Limitations and follow-ups
 
-Não cria TCP/53. As únicas saídas adicionadas pelo módulo são UDP/53 para `10.16.0.2`, TCP/443 para o SG referenciado e TCP/443 para a prefix list informada.
+Cada instância cria somente uma regra. O caller precisa repetir o módulo para DNS UDP/TCP, HTTPS público ou outros destinos. O contrato atual cobre apenas IPv4 e não oferece `cidr_ipv6` nem regras sem portas, como `ip_protocol = "-1"`.
 
-As duas regras HTTPS são obrigatórias no contrato atual do módulo. Ele não permite habilitar somente Interface Endpoint ou somente Gateway Endpoint. Isso atende ao escopo atual de acesso privado ao ECR, cujas imagens também dependem do S3, mas reduz a reutilização do módulo para outros cenários.
+No caller atual, as instâncias usam `module.sg_egress_eks.sg_id`, mas o módulo de SG declarado se chama `module.sg_egress_eks_ecr`; essa inconsistência impede a validação até ser corrigida.
 
 ### `security_group_ingress_rule.tf`
 
@@ -466,7 +550,7 @@ Cria a regra de entrada HTTPS nos SGs dos Interface Endpoints.
 
 #### Intended use
 
-Permitir que clientes identificados por outro SG acessem o endpoint.
+Permitir que clientes identificados por outro SG acessem um Interface Endpoint quando essa arquitetura for reativada.
 
 #### Resources and behavior
 
@@ -500,7 +584,7 @@ module "sg_ingress_interface_rule" {
 
 #### Limitations and follow-ups
 
-Permite somente TCP/443.
+Permite somente TCP/443. Não é necessário para o NAT Gateway regional nem para o Gateway Endpoint do S3; não há caller ativo no root `live`.
 
 ## Root ativo
 
@@ -508,8 +592,9 @@ Consulte [`live/README.md`](live/README.md) para o mapa dos arquivos, fluxo de d
 
 ## Próximos passos
 
-- Associar o security group cliente aos nodes ou pods quando o cluster EKS for criado.
-- Avaliar TCP/53 caso o ambiente precise suportar consultas DNS por TCP.
-- Mapear os endpoints adicionais exigidos pelo EKS e pelos add-ons antes de operar sem NAT Gateway.
+- Corrigir as referências `module.sg_egress_eks.sg_id` para o nome efetivamente declarado no caller de egress.
+- Associar o SG de egress aos nodes ou pods do EKS quando o cluster for criado.
+- Executar `terraform init`, `terraform validate` e `terraform plan` após concluir a transição.
+- Monitorar custos e confirmar que o tráfego S3 usa o Gateway Endpoint em vez do NAT.
 - Remover valores regionais fixos dos módulos caso o projeto precise suportar outras regiões.
 - Definir se `environments/dev` e `environments/prod` serão roots completos ou apenas conjuntos de variáveis.
