@@ -4,6 +4,8 @@ module "alb_internet_facing" {
   subnets_ids        = [module.subnet-public-b.subnet_id, module.subnet-public-a.subnet_id]
   internal           = false
   security_group_ids = [module.sg_alb.sg_id]
+  bucket             = module.s3_alb.bucket_id
+  enabled            = true
   tags = merge(
     var.environment_tags,
     {

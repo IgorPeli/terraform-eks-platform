@@ -33,3 +33,15 @@ variable "security_group_ids" {
   description = "security group that is associated"
 
 }
+
+variable "enabled" {
+  type        = bool
+  description = "true to activate the bucket of the ALB"
+
+}
+
+variable "bucket" {
+  type        = string
+  description = "bucket to vinculate to the ALB"
+
+}
