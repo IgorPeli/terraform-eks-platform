@@ -1,22 +1,27 @@
 variable "security_group_id" {
-  type = string
+  type        = string
+  description = "ID of the security group that receives the egress rule."
 }
 
 variable "description" {
-  type    = string
-  default = null
+  type        = string
+  description = "Description of the egress rule."
+  default     = null
 }
 
 variable "ip_protocol" {
-  type = string
+  type        = string
+  description = "IP protocol used by the rule."
 }
 
 variable "from_port" {
-  type = number
+  type        = number
+  description = "Start of the destination port range."
 }
 
 variable "to_port" {
-  type = number
+  type        = number
+  description = "End of the destination port range."
 }
 
 variable "destination_type" {

@@ -15,6 +15,9 @@ Esta pasta é o root Terraform executado atualmente. Os comandos `terraform init
 - Um único ID de NAT Gateway regional consumido pelas duas subnets privadas.
 - Gateway Endpoint do S3 associado às duas route tables privadas.
 - Nenhum Interface Endpoint instanciado no root ativo.
+- Um SG do EKS com regras de ingress e egress explícitas.
+- Um SG do ALB com ingress HTTPS público e egress HTTPS para o SG do EKS.
+- Um caller de ALB internet-facing posicionado nas duas subnets públicas.
 
 As subnets privadas não apontam diretamente para o Internet Gateway. Elas encaminham tráfego externo para o NAT Gateway, que permite conexões iniciadas pelos workloads privados sem aceitar conexões de entrada não solicitadas. Esse caminho atende, entre outros casos, ao polling do Argo CD sobre repositórios no GitHub.
 
@@ -70,8 +73,10 @@ A rota da prefix list do S3 é mais específica que `0.0.0.0/0` e, por longest p
 | `01_vpc.tf` | Módulo VPC e Internet Gateway. |
 | `01_nat.tf` | Instância do NAT Gateway regional. |
 | `01_subnet.tf` | Duas subnets públicas, duas privadas e seus destinos de rota. |
-| `02_sg_engress_eks.tf` | SG cliente e regras de egress para DNS, HTTPS público e S3. |
+| `02_sg_engress_eks.tf` | SG do EKS e regras de egress para DNS, HTTPS público e S3. |
+| `02_sg_ingress_eks.tf` | Regra de ingress do EKS proveniente do SG do ALB. |
 | `03_endpoint_gateway.tf` | Gateway Endpoint do S3 nas route tables privadas. |
+| `04_alb.tf` | ALB internet-facing, SG do ALB e regras de ingress/egress. |
 
 O arquivo `03_endpoint_interface.tf` foi retirado do root ativo. O módulo reutilizável continua disponível em `../modules/endpoint_interface`.
 
@@ -85,9 +90,16 @@ module.vpc
 ├── module.subnet-private-a/b
 │       ├── module.nat_gateway.nat_id
 │       └── module.s3_gateway via route_table_id
-└── module.sg_egress_eks_ecr
-        ├── egress DNS UDP/TCP e HTTPS público
-        └── module.egress_s3_gateway via prefix_list_id
+├── module.sg_eks
+│       ├── ingress HTTPS a partir de module.sg_alb
+│       ├── egress DNS UDP/TCP e HTTPS público
+│       └── module.egress_s3_gateway via prefix_list_id
+├── module.sg_alb
+│       ├── ingress HTTPS de 0.0.0.0/0
+│       └── egress HTTPS para module.sg_eks
+└── module.alb_internet_facing
+        ├── module.subnet-public-a/b
+        └── module.sg_alb
 ```
 
 - `module.nat_gateway` recebe `module.vpc.vpc_id` e declara dependência do Internet Gateway.
@@ -131,9 +143,11 @@ O Gateway Endpoint não cria ENIs nem possui SG próprio. A route table direcion
 
 O módulo `endpoint_interface` não é instanciado neste root, mas permanece no repositório. Ele pode ser reutilizado se surgir requisito de tráfego privado, restrição de egress ou compliance. A reativação exige restaurar callers, SG das ENIs e regras de entrada e saída compatíveis.
 
-### Security group de egress
+### Security groups
 
-`module.sg_egress_eks_ecr` cria o SG cliente sem regras próprias. O módulo genérico `security_group_egress_rule.tf` é instanciado quatro vezes:
+`module.sg_eks` e `module.sg_alb` usam o mesmo módulo genérico `security_group`. A separação ocorre por recurso protegido, não por direção de tráfego: cada SG pode receber regras de ingress e egress.
+
+O módulo `security_group_egress_rule` é instanciado quatro vezes para o SG do EKS:
 
 - UDP/53 para o resolver da VPC em `10.16.0.2/32`;
 - TCP/53 para o resolver da VPC em `10.16.0.2/32`;
@@ -142,16 +156,18 @@ O módulo `endpoint_interface` não é instanciado neste root, mas permanece no 
 
 Cada regra seleciona seu destino por `destination_type`: `cidr_ipv4`, `prefix_list` ou `security_group`. O NAT Gateway não é destino do SG; a regra HTTPS autoriza os endereços externos e a route table encaminha esse tráfego ao NAT.
 
-## Estado da transição
+O SG do ALB permite ingress TCP/443 de `0.0.0.0/0` e egress TCP/443 para o SG do EKS. O SG do EKS aceita TCP/443 cuja origem seja o SG do ALB. As respostas são tratadas de forma stateful pelos security groups.
 
-> [!warning]
-> As quatro instâncias de regra em `02_sg_engress_eks.tf` referenciam `module.sg_egress_eks.sg_id`, mas o SG declarado no mesmo arquivo se chama `module.sg_egress_eks_ecr`. Essa referência precisa ser corrigida antes que `terraform validate`, `terraform plan` ou `terraform apply` concluam com sucesso.
+### Application Load Balancer
 
-A documentação registra a arquitetura decidida sem ocultar esse estado transitório. Como o pedido atual autoriza somente documentação, os arquivos Terraform legados não foram alterados.
+`module.alb_internet_facing` configura o ALB com `internal = false`, associa as duas subnets públicas e usa apenas `module.sg_alb`. Os nodes e pods do EKS permanecem destinados às subnets privadas; o encaminhamento futuro ocorrerá por target group usando endereços privados.
+
+## Estado da configuração
+
+> [!note]
+> O módulo `load_balancer` cria o ALB e associa subnets e SGs, mas ainda não cria listener, target group nem associação de targets. Esses componentes são necessários para o ALB encaminhar tráfego aos workloads.
 
 ## Comandos
-
-Após corrigir a referência do SG nas regras de egress:
 
 ```bash
 terraform init
@@ -169,12 +185,14 @@ Revise o `terraform plan` antes do apply para confirmar:
 - rotas privadas apontando para o NAT Gateway;
 - preservação do Gateway Endpoint do S3 nas duas route tables privadas;
 - egress DNS UDP/TCP, HTTPS público e HTTPS para a prefix list do S3.
+- ALB associado somente às duas subnets públicas e ao SG do ALB.
+- ingress do EKS limitado à origem `module.sg_alb` na porta 443.
 
 ## Limitações atuais
 
-- As regras de egress possuem uma referência inválida ao nome do módulo de SG.
 - O cluster EKS ainda não está definido neste root.
-- O SG de egress ainda não está associado a nodes ou pods reais.
+- O SG do EKS ainda não está associado a nodes ou pods reais.
+- O módulo de ALB ainda não possui listener, target group, targets ou access logs.
 - O NAT regional simplifica HA, mas possui cobrança horária por AZ atendida e por volume processado.
 - O Gateway Endpoint reduz processamento do NAT para S3, mas ainda não possui policy customizada.
 - A tag interna `Purpose = "eks-interface-endpoints"` do NAT não representa sua finalidade atual.

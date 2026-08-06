@@ -1,21 +1,21 @@
-module "sg_egress_eks_ecr" {
-  name        = "egress-eks-ecr"
-  description = "SG that allow egress Nat gateway"
-  source      = "../modules/security_group_egress"
+module "sg_eks" {
+  name        = "eks"
+  description = "Security group for EKS workloads"
+  source      = "../modules/security_group"
   vpc_id      = module.vpc.vpc_id
   tags = merge(
     var.environment_tags,
     {
-      Owner = "Ig0d"
-      Type  = "Egress"
+      Owner   = "Ig0d"
+      Purpose = "EKS"
 
   })
 }
 
 module "egress_dns_udp" {
-  source = "../modules/security_group_egress_rule.tf"
+  source = "../modules/security_group_egress_rule"
 
-  security_group_id = module.sg_egress_eks.sg_id
+  security_group_id = module.sg_eks.sg_id
   description       = "DNS UDP to VPC resolver"
   ip_protocol       = "udp"
   from_port         = 53
@@ -25,9 +25,9 @@ module "egress_dns_udp" {
 }
 
 module "egress_dns_tcp" {
-  source = "../modules/security_group_egress_rule.tf"
+  source = "../modules/security_group_egress_rule"
 
-  security_group_id = module.sg_egress_eks.sg_id
+  security_group_id = module.sg_eks.sg_id
   description       = "DNS TCP to VPC resolver"
   ip_protocol       = "tcp"
   from_port         = 53
@@ -37,9 +37,9 @@ module "egress_dns_tcp" {
 }
 
 module "egress_https_internet" {
-  source = "../modules/security_group_egress_rule.tf"
+  source = "../modules/security_group_egress_rule"
 
-  security_group_id = module.sg_egress_eks.sg_id
+  security_group_id = module.sg_eks.sg_id
   description       = "HTTPS internet access through NAT"
   ip_protocol       = "tcp"
   from_port         = 443
@@ -49,9 +49,9 @@ module "egress_https_internet" {
 }
 
 module "egress_s3_gateway" {
-  source = "../modules/security_group_egress_rule.tf"
+  source = "../modules/security_group_egress_rule"
 
-  security_group_id = module.sg_egress_eks.sg_id
+  security_group_id = module.sg_eks.sg_id
   description       = "HTTPS to S3 Gateway Endpoint"
   ip_protocol       = "tcp"
   from_port         = 443

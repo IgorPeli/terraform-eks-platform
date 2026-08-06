@@ -26,9 +26,6 @@ O Gateway Endpoint do S3 foi mantido porque não possui cobrança adicional e ev
 
 O módulo `endpoint_gateway` integra a arquitetura ativa por meio do caller do S3. O módulo `endpoint_interface` permanece no repositório como componente reutilizável, mas não é instanciado; ele pode voltar a ser usado se houver requisito de conectividade privada, restrição de egress, compliance ou vantagem econômica comprovada.
 
-> [!warning]
-> O caller de egress já declara DNS UDP/TCP, HTTPS público e HTTPS para a prefix list do S3. Porém, suas quatro instâncias referenciam `module.sg_egress_eks.sg_id`, enquanto o SG declarado se chama `module.sg_egress_eks_ecr`. Essa referência precisa ser corrigida antes que a configuração ativa possa ser validada e aplicada.
-
 ## Estrutura
 
 ```text
@@ -40,11 +37,11 @@ O módulo `endpoint_gateway` integra a arquitetura ativa por meio do caller do S
 └── modules/
     ├── endpoint_gateway/
     ├── endpoint_interface/
+    ├── load_balancer/
     ├── nat_gateway/
-    ├── security_group_egress/
-    ├── security_group_egress_rule.tf/
-    ├── security_group_ingress/
-    ├── security_group_ingress_rule.tf/
+    ├── security_group/
+    ├── security_group_egress_rule/
+    ├── security_group_ingress_rule/
     ├── subnet/
     └── vpc/
 ```
@@ -284,7 +281,7 @@ module "ecr_interface" {
   source             = "../modules/endpoint_interface"
   vpc_id             = module.vpc.vpc_id
   service_name       = "com.amazonaws.us-east-2.ecr.dkr"
-  security_group_ids = [module.sg_ingress_interface.sg_id]
+  security_group_ids = [module.sg_interface.sg_id]
   subnet_ids         = [module.subnet-private-a.subnet_id]
   tags               = var.environment_tags
 }
@@ -366,51 +363,54 @@ O módulo não recebe uma policy customizada para restringir o acesso ao S3, inc
 
 O caller ativo associa o endpoint S3 às duas route tables privadas. A rota baseada na prefix list é mais específica que `0.0.0.0/0`, por isso o tráfego S3 usa o Gateway Endpoint enquanto os demais destinos continuam usando o NAT regional.
 
-### `security_group_egress`
+### `security_group`
 
-Path: [`modules/security_group_egress`](modules/security_group_egress)
+Path: [`modules/security_group`](modules/security_group)
 
 #### Purpose
 
-Cria um security group destinado aos clientes, como nodes ou pods do EKS.
+Cria um security group reutilizável, sem separar o recurso por direção de tráfego.
 
 #### Intended use
 
-Associar aos workloads que precisam de regras de saída explícitas. O módulo pode ser combinado tanto com regras para destinos públicos via NAT quanto com regras para endpoints privados.
+Criar o SG de cada componente, como ALB ou EKS, e adicionar regras de ingress e egress por meio dos módulos de regra. O mesmo SG pode receber regras nos dois sentidos.
 
 #### Resources and behavior
 
 - Cria `aws_security_group.security_group`.
-- Não cria regras próprias.
-- Ao criar o SG, o provider Terraform AWS remove a regra AWS padrão que permitiria todo o egress.
-- As regras de saída devem ser adicionadas separadamente pelo caller.
+- Não declara regras inline.
+- Ao criar o SG, o provider Terraform AWS remove a regra AWS padrão de egress irrestrito.
+- Adiciona as tags `Service = "network"` e `ManagedBy = "Terraform"`.
+- Regras de ingress e egress são recursos independentes criados pelos callers.
 
 #### Inputs
 
 | Nome | Tipo | Obrigatório | Finalidade |
 | --- | --- | --- | --- |
 | `name` | `string` | sim | Nome do SG. |
-| `description` | `string` | sim | Descrição. |
+| `description` | `string` | sim | Descrição do SG. |
 | `vpc_id` | `string` | sim | VPC do SG. |
-| `tags` | `map(string)` | sim | Tags adicionais. |
+| `tags` | `map(string)` | não | Tags adicionais; padrão `{}`. |
 
 #### Outputs
 
 | Nome | Descrição | Consumidores |
 | --- | --- | --- |
-| `sg_id` | ID do SG. | Regras e workloads. |
+| `sg_id` | ID do SG. | Regras, ALB, EKS e outros recursos de rede. |
 
 #### Dependencies and assumptions
 
-Depende de uma VPC existente no caller.
+- Depende de uma VPC existente no caller.
+- O caller é responsável por associar o SG ao recurso protegido.
+- Respostas a tráfego permitido são tratadas de forma stateful pelo security group.
 
 #### Example
 
 ```hcl
-module "sg_egress_eks_ecr" {
-  source      = "../modules/security_group_egress"
-  name        = "egress-eks-ecr"
-  description = "SG that allows egress to private endpoints"
+module "sg_alb" {
+  source      = "../modules/security_group"
+  name        = "alb"
+  description = "Security group for the internet-facing ALB"
   vpc_id      = module.vpc.vpc_id
   tags        = var.environment_tags
 }
@@ -418,66 +418,11 @@ module "sg_egress_eks_ecr" {
 
 #### Limitations and follow-ups
 
-O SG ainda não é associado a um cluster EKS neste projeto. Sem regras externas, ele não permite iniciar tráfego de saída. O root ativo instancia regras separadas para DNS UDP/TCP, HTTPS público e HTTPS para a prefix list do S3.
+O módulo não cria nem associa regras automaticamente. Cada regra necessária deve ser declarada separadamente.
 
-### `security_group_ingress`
+### `security_group_egress_rule`
 
-Path: [`modules/security_group_ingress`](modules/security_group_ingress)
-
-#### Purpose
-
-Cria o security group das ENIs dos Interface Endpoints.
-
-#### Intended use
-
-Associar a Interface Endpoints quando os módulos de conectividade privada forem reativados e permitir entrada a partir do SG dos clientes. Não é necessário para o NAT Gateway regional.
-
-#### Resources and behavior
-
-- Cria `aws_security_group.security_group`.
-- Não cria regras próprias.
-- Ao criar o SG, o provider Terraform AWS remove a regra AWS padrão que permitiria todo o egress.
-- Quando instanciado, exige uma regra externa de ingress TCP/443; não cria egress para iniciar novas conexões.
-- Como security groups são stateful, respostas ao ingress permitido podem sair sem uma regra de egress equivalente.
-
-#### Inputs
-
-| Nome | Tipo | Obrigatório | Finalidade |
-| --- | --- | --- | --- |
-| `name` | `string` | sim | Nome do SG. |
-| `description` | `string` | sim | Descrição. |
-| `vpc_id` | `string` | sim | VPC do SG. |
-| `tags` | `map(string)` | sim | Tags adicionais. |
-
-#### Outputs
-
-| Nome | Descrição | Consumidores |
-| --- | --- | --- |
-| `sg_id` | ID do SG. | Interface Endpoints e regra de ingress. |
-
-#### Dependencies and assumptions
-
-Depende de uma VPC existente e de regras criadas pelo caller.
-
-#### Example
-
-```hcl
-module "sg_ingress_interface" {
-  source      = "../modules/security_group_ingress"
-  name        = "ingress-eks-ecr"
-  description = "SG that allows ingress from EKS"
-  vpc_id      = module.vpc.vpc_id
-  tags        = var.environment_tags
-}
-```
-
-#### Limitations and follow-ups
-
-Não associa o SG aos endpoints automaticamente. O root `live` não instancia este módulo porque não possui Interface Endpoints ativos.
-
-### `security_group_egress_rule.tf`
-
-Path: [`modules/security_group_egress_rule.tf`](modules/security_group_egress_rule.tf)
+Path: [`modules/security_group_egress_rule`](modules/security_group_egress_rule)
 
 #### Purpose
 
@@ -522,9 +467,9 @@ Não possui outputs.
 
 ```hcl
 module "egress_s3_gateway" {
-  source = "../modules/security_group_egress_rule.tf"
+  source = "../modules/security_group_egress_rule"
 
-  security_group_id = module.sg_egress_eks_ecr.sg_id
+  security_group_id = module.sg_eks.sg_id
   description       = "HTTPS to S3 Gateway Endpoint"
   ip_protocol       = "tcp"
   from_port         = 443
@@ -538,31 +483,36 @@ module "egress_s3_gateway" {
 
 Cada instância cria somente uma regra. O caller precisa repetir o módulo para DNS UDP/TCP, HTTPS público ou outros destinos. O contrato atual cobre apenas IPv4 e não oferece `cidr_ipv6` nem regras sem portas, como `ip_protocol = "-1"`.
 
-No caller atual, as instâncias usam `module.sg_egress_eks.sg_id`, mas o módulo de SG declarado se chama `module.sg_egress_eks_ecr`; essa inconsistência impede a validação até ser corrigida.
+### `security_group_ingress_rule`
 
-### `security_group_ingress_rule.tf`
-
-Path: [`modules/security_group_ingress_rule.tf`](modules/security_group_ingress_rule.tf)
+Path: [`modules/security_group_ingress_rule`](modules/security_group_ingress_rule)
 
 #### Purpose
 
-Cria a regra de entrada HTTPS nos SGs dos Interface Endpoints.
+Cria uma regra de ingress configurável para um security group.
 
 #### Intended use
 
-Permitir que clientes identificados por outro SG acessem um Interface Endpoint quando essa arquitetura for reativada.
+Instanciar uma vez para cada combinação de protocolo, portas e origem. A origem pode ser um CIDR IPv4, uma prefix list ou outro security group.
 
 #### Resources and behavior
 
-- Cria `aws_vpc_security_group_ingress_rule.allow_tpc`.
-- Permite TCP/443 do SG referenciado para o SG de destino.
+- Cria um único `aws_vpc_security_group_ingress_rule.rule` por instância.
+- Usa `source_type` para selecionar exatamente um entre `cidr_ipv4`, `prefix_list_id` e `referenced_security_group_id`.
+- Atribui `source_value` ao campo selecionado e define os outros dois como `null`.
+- Valida `source_type` contra `cidr_ipv4`, `prefix_list` e `security_group`.
 
 #### Inputs
 
 | Nome | Tipo | Obrigatório | Finalidade |
 | --- | --- | --- | --- |
-| `security_group_id` | `string` | sim | SG de destino. |
-| `referenced_security_group_id` | `string` | sim | SG de origem. |
+| `security_group_id` | `string` | sim | SG que recebe a regra. |
+| `description` | `string` | não | Descrição da regra; padrão `null`. |
+| `ip_protocol` | `string` | sim | Protocolo, como `tcp` ou `udp`. |
+| `from_port` | `number` | sim | Porta inicial. |
+| `to_port` | `number` | sim | Porta final. |
+| `source_type` | `string` | sim | Seleciona `cidr_ipv4`, `prefix_list` ou `security_group`. |
+| `source_value` | `string` | sim | CIDR, ID de prefix list ou ID de SG, conforme o tipo escolhido. |
 
 #### Outputs
 
@@ -570,21 +520,85 @@ Não possui outputs.
 
 #### Dependencies and assumptions
 
-Os dois SGs devem ser compatíveis para referência entre grupos.
+- O caller deve fornecer uma origem compatível com `source_type`.
+- Para `security_group`, os grupos precisam admitir referência entre si.
+- O nome `source_value` é usado porque `source` é um argumento reservado dos blocos `module` do Terraform.
 
 #### Example
 
 ```hcl
-module "sg_ingress_interface_rule" {
-  source                       = "../modules/security_group_ingress_rule.tf"
-  security_group_id            = module.sg_ingress_interface.sg_id
-  referenced_security_group_id = module.sg_egress_eks_ecr.sg_id
+module "alb_ingress_https" {
+  source = "../modules/security_group_ingress_rule"
+
+  security_group_id = module.sg_alb.sg_id
+  description       = "HTTPS from the internet"
+  ip_protocol       = "tcp"
+  from_port         = 443
+  to_port           = 443
+  source_type       = "cidr_ipv4"
+  source_value      = "0.0.0.0/0"
 }
 ```
 
 #### Limitations and follow-ups
 
-Permite somente TCP/443. Não é necessário para o NAT Gateway regional nem para o Gateway Endpoint do S3; não há caller ativo no root `live`.
+Cada instância cria somente uma regra. O contrato atual cobre apenas IPv4 e exige intervalo de portas.
+
+### `load_balancer`
+
+Path: [`modules/load_balancer`](modules/load_balancer)
+
+#### Purpose
+
+Cria um Elastic Load Balancer configurável; o caller ativo usa o tipo Application Load Balancer.
+
+#### Intended use
+
+Criar o ALB internet-facing nas duas subnets públicas e associar o SG do ALB.
+
+#### Resources and behavior
+
+- Cria `aws_lb.test`.
+- Recebe tipo, esquema interno/público, subnets e security groups.
+- Adiciona a tag `ManagedBy = "Terraform"`.
+
+#### Inputs
+
+| Nome | Tipo | Obrigatório | Finalidade |
+| --- | --- | --- | --- |
+| `load_balancer_type` | `string` | não | Tipo do load balancer; padrão `application`. |
+| `name` | `string` | sim | Nome do load balancer. |
+| `internal` | `bool` | sim | Define se o load balancer é interno. |
+| `tags` | `map(string)` | sim | Tags adicionais. |
+| `subnets_ids` | `list(string)` | sim | Subnets usadas pelo load balancer. |
+| `security_group_ids` | `list(string)` | sim | Security groups associados. |
+
+#### Outputs
+
+Não possui outputs.
+
+#### Dependencies and assumptions
+
+- As subnets e os SGs devem pertencer à mesma VPC.
+- Um ALB internet-facing deve usar subnets públicas em Availability Zones distintas.
+- Listeners, target groups e targets são responsabilidades externas ao módulo atual.
+
+#### Example
+
+```hcl
+module "alb_internet_facing" {
+  source             = "../modules/load_balancer"
+  name               = "eks-internet-facing"
+  internal           = false
+  subnets_ids        = [module.subnet-public-a.subnet_id, module.subnet-public-b.subnet_id]
+  security_group_ids = [module.sg_alb.sg_id]
+  tags               = var.environment_tags
+}
+```
+
+#### Limitations and follow-ups
+
+O módulo ainda não cria listener, target group, target attachments ou health check. Access logs também ainda não são configurados.
 
 ## Root ativo
 
@@ -592,8 +606,8 @@ Consulte [`live/README.md`](live/README.md) para o mapa dos arquivos, fluxo de d
 
 ## Próximos passos
 
-- Corrigir as referências `module.sg_egress_eks.sg_id` para o nome efetivamente declarado no caller de egress.
-- Associar o SG de egress aos nodes ou pods do EKS quando o cluster for criado.
+- Associar `module.sg_eks` aos nodes ou pods do EKS quando o cluster for criado.
+- Completar o módulo de ALB com listener, target group, targets e, se necessário, access logs.
 - Executar `terraform init`, `terraform validate` e `terraform plan` após concluir a transição.
 - Monitorar custos e confirmar que o tráfego S3 usa o Gateway Endpoint em vez do NAT.
 - Remover valores regionais fixos dos módulos caso o projeto precise suportar outras regiões.
