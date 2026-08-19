@@ -15,7 +15,7 @@ O root `live` usa a região `us-east-2` e o profile `terraform-local`. Ele cria:
 - um Gateway Endpoint do S3 associado às route tables privadas;
 - um bucket S3 versionado com policy de entrega para os access logs do ALB;
 - um Application Load Balancer internet-facing nas duas subnets públicas;
-- um listener HTTP/80 que encaminha para um target group HTTP/80 ainda sem targets associados.
+- um listener HTTPS/443 que encaminha para um target group HTTP/80 ainda sem targets associados; o caller ainda não informa o certificado exigido pelo listener.
 
 O NAT Gateway regional fornece um único ID para as route tables privadas e expande a cobertura entre Availability Zones conforme a presença de workloads. Diferentemente do NAT Gateway zonal, ele não é criado dentro de uma subnet pública. O Internet Gateway e o NAT regional pertencem à mesma VPC; a AWS gerencia a route table própria do NAT com o caminho até o Internet Gateway.
 
@@ -681,7 +681,7 @@ Cria um listener para um load balancer e encaminha sua ação padrão para um ta
 
 #### Intended use
 
-Conectar um ALB existente a um target group. No root `live`, o módulo cria um listener HTTP na porta 80 para `module.alb_target_group`.
+Conectar um ALB existente a um target group. No root `live`, o módulo declara um listener HTTPS na porta 443 para `module.alb_target_group`.
 
 #### Resources and behavior
 
@@ -715,16 +715,17 @@ Não possui outputs.
 ```hcl
 module "alb_listener" {
   source            = "../modules/load_balancer_listener"
-  port              = 80
+  port              = 443
   load_balancer_arn = module.alb_internet_facing.alb_arn
-  protocol          = "HTTP"
+  protocol          = "HTTPS"
+  certificate_arn   = "<acm-certificate-arn>"
   target_group_arn  = module.alb_target_group.target_group_arn
 }
 ```
 
 #### Limitations and follow-ups
 
-O módulo oferece somente uma ação padrão `forward`. Não há validação explícita de protocolos e portas, regras adicionais, redirect, fixed response, autenticação ou suporte a uma policy TLS configurável.
+O módulo oferece somente uma ação padrão `forward`. Não há validação explícita de protocolos e portas, regras adicionais, redirect, fixed response, autenticação ou suporte a uma policy TLS configurável. Um listener HTTPS/443 falha sem um `certificate_arn` válido; o caller atual ainda não fornece esse valor.
 
 ### `target_group`
 
@@ -788,7 +789,8 @@ Consulte [`live/README.md`](live/README.md) para o mapa dos arquivos, fluxo de d
 ## Próximos passos
 
 - Associar `module.sg_eks` aos nodes ou pods do EKS quando o cluster for criado.
-- Associar targets ao target group do ALB e alinhar as portas do listener/target group com os security groups.
+- Criar e validar um certificado ACM e informar seu ARN ao listener HTTPS/443.
+- Associar targets HTTP/80 ao target group do ALB, de forma compatível com o tipo de target e com o workload do EKS.
 - Executar `terraform init`, `terraform validate` e `terraform plan` após concluir a transição.
 - Monitorar custos e confirmar que o tráfego S3 usa o Gateway Endpoint em vez do NAT.
 - Remover valores regionais fixos dos módulos caso o projeto precise suportar outras regiões.

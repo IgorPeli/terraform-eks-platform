@@ -18,9 +18,9 @@ module "alb_internet_facing" {
 
 module "alb_listener" {
   source            = "../modules/load_balancer_listener"
-  port              = 80
+  port              = 443
   load_balancer_arn = module.alb_internet_facing.alb_arn
-  protocol          = "HTTP"
+  protocol          = "HTTPS"
   target_group_arn  = module.alb_target_group.target_group_arn
 }
 
@@ -60,11 +60,11 @@ module "alb_ingress_https" {
 }
 
 module "alb_egress_eks" {
-  source = "../modules/security_group_egress_rule"
-  from_port         = 443
-  to_port           = 443
+  source            = "../modules/security_group_egress_rule"
+  from_port         = 80
+  to_port           = 80
   security_group_id = module.sg_alb.sg_id
-  description       = "HTTPS to EKS workloads"
+  description       = "HTTP to EKS workloads"
   destination_type  = "security_group"
   destination       = module.sg_eks.sg_id
   ip_protocol       = "tcp"

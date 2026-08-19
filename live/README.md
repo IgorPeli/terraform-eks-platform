@@ -16,11 +16,11 @@ Esta pasta é o root Terraform executado atualmente. Os comandos `terraform init
 - Gateway Endpoint do S3 associado às duas route tables privadas.
 - Nenhum Interface Endpoint instanciado no root ativo.
 - Um SG do EKS com regras de ingress e egress explícitas.
-- Um SG do ALB com ingress HTTPS público e egress HTTPS para o SG do EKS.
+- Um SG do ALB com ingress HTTPS/443 público e egress HTTP/80 para o SG do EKS.
 - Um caller de ALB internet-facing posicionado nas duas subnets públicas.
 - Um bucket S3 versionado para os access logs do ALB.
 - Uma bucket policy limitada à entrega de logs do ALB no caminho da conta atual.
-- Um listener HTTP/80 com ação padrão para um target group HTTP/80 ainda sem targets.
+- Um listener HTTPS/443 com ação padrão para um target group HTTP/80 ainda sem targets; o listener ainda não recebe o certificado obrigatório.
 
 As subnets privadas não apontam diretamente para o Internet Gateway. Elas encaminham tráfego externo para o NAT Gateway, que permite conexões iniciadas pelos workloads privados sem aceitar conexões de entrada não solicitadas. Esse caminho atende, entre outros casos, ao polling do Argo CD sobre repositórios no GitHub.
 
@@ -95,12 +95,12 @@ module.vpc
 │       ├── module.nat_gateway.nat_id
 │       └── module.s3_gateway via route_table_id
 ├── module.sg_eks
-│       ├── ingress HTTPS a partir de module.sg_alb
+│       ├── ingress HTTP/80 a partir de module.sg_alb
 │       ├── egress DNS UDP/TCP e HTTPS público
 │       └── module.egress_s3_gateway via prefix_list_id
 ├── module.sg_alb
 │       ├── ingress HTTPS de 0.0.0.0/0
-│       └── egress HTTPS para module.sg_eks
+│       └── egress HTTP/80 para module.sg_eks
 ├── module.s3_alb
 │       ├── aws_s3_bucket_versioning
 │       └── aws_s3_bucket_policy.alb_access_logs
@@ -172,15 +172,15 @@ O módulo `security_group_egress_rule` é instanciado quatro vezes para o SG do 
 
 Cada regra seleciona seu destino por `destination_type`: `cidr_ipv4`, `prefix_list` ou `security_group`. O NAT Gateway não é destino do SG; a regra HTTPS autoriza os endereços externos e a route table encaminha esse tráfego ao NAT.
 
-O SG do ALB permite ingress TCP/443 de `0.0.0.0/0` e egress TCP/443 para o SG do EKS. O SG do EKS aceita TCP/443 cuja origem seja o SG do ALB. As respostas são tratadas de forma stateful pelos security groups.
+O SG do ALB permite ingress TCP/443 de `0.0.0.0/0` e egress TCP/80 para o SG do EKS. O SG do EKS aceita TCP/80 cuja origem seja o SG do ALB. Esse conjunto implementa HTTPS até o ALB e HTTP restrito pelos SGs no caminho interno até os workloads. As respostas são tratadas de forma stateful pelos security groups.
 
 ### Application Load Balancer
 
 `module.alb_internet_facing` configura o ALB com `internal = false`, associa as duas subnets públicas, usa `module.sg_alb` e habilita access logs no bucket `module.s3_alb`.
 
-`module.alb_listener` cria um listener HTTP/80 cuja ação padrão encaminha para `module.alb_target_group`. O target group `eks-workloads-http` também usa HTTP/80 e pertence à VPC ativa, mas ainda não possui targets associados.
+`module.alb_listener` declara um listener HTTPS/443 cuja ação padrão encaminha para `module.alb_target_group`. O target group `eks-workloads-http` usa HTTP/80 e pertence à VPC ativa, implementando terminação TLS no ALB e encaminhamento interno sem TLS.
 
-O caminho ainda não está operacional: o SG do ALB permite ingress e egress somente em TCP/443, e o SG do EKS aceita a origem do ALB somente em TCP/443. Essas regras não correspondem ao listener e ao target group em HTTP/80. Os nodes e pods do EKS também ainda não existem no root ativo.
+O caminho ainda não está operacional: o caller não informa `certificate_arn` ao listener HTTPS e o target group ainda não possui targets associados. Os nodes e pods do EKS também ainda não existem no root ativo. As regras dos SGs já correspondem ao fluxo externo HTTPS/443 e interno HTTP/80.
 
 ### Bucket de access logs do ALB
 
@@ -191,7 +191,7 @@ O caminho ainda não está operacional: o SG do ALB permite ingress e egress som
 ## Estado da configuração
 
 > [!note]
-> O ALB possui listener e target group em HTTP/80, mas ainda não possui associação de targets. Além disso, os security groups atuais permitem TCP/443, não TCP/80; portanto, o caminho de entrada e encaminhamento ainda não está operacional.
+> O ALB declara listener HTTPS/443 e target group HTTP/80. Os security groups estão alinhados a esse fluxo, mas o listener ainda não recebe um certificado e o target group não possui associação de targets; portanto, o caminho ainda não está operacional.
 
 ## Comandos
 
@@ -212,16 +212,16 @@ Revise o `terraform plan` antes do apply para confirmar:
 - preservação do Gateway Endpoint do S3 nas duas route tables privadas;
 - egress DNS UDP/TCP, HTTPS público e HTTPS para a prefix list do S3.
 - ALB associado somente às duas subnets públicas e ao SG do ALB.
-- ingress do EKS limitado à origem `module.sg_alb` na porta 443.
+- ingress do EKS limitado à origem `module.sg_alb` na porta 80.
 - bucket S3 versionado, na mesma região do ALB, com policy de entrega restrita à conta atual.
-- listener e target group em HTTP/80, sem targets, e a divergência em relação às regras TCP/443 dos SGs.
+- listener HTTPS/443 com certificado ACM válido e target group HTTP/80 com targets compatíveis.
 
 ## Limitações atuais
 
 - O cluster EKS ainda não está definido neste root.
 - O SG do EKS ainda não está associado a nodes ou pods reais.
 - O target group do ALB ainda não possui targets associados nem health check customizado.
-- As portas do listener e do target group (HTTP/80) divergem das regras dos SGs do ALB e do EKS (TCP/443).
+- O listener HTTPS/443 ainda não recebe o `certificate_arn` obrigatório do ACM.
 - O bucket de access logs ainda não possui lifecycle de retenção/expiração.
 - O NAT regional simplifica HA, mas possui cobrança horária por AZ atendida e por volume processado.
 - O Gateway Endpoint reduz processamento do NAT para S3, mas ainda não possui policy customizada.
