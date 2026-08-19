@@ -18,6 +18,9 @@ Esta pasta é o root Terraform executado atualmente. Os comandos `terraform init
 - Um SG do EKS com regras de ingress e egress explícitas.
 - Um SG do ALB com ingress HTTPS público e egress HTTPS para o SG do EKS.
 - Um caller de ALB internet-facing posicionado nas duas subnets públicas.
+- Um bucket S3 versionado para os access logs do ALB.
+- Uma bucket policy limitada à entrega de logs do ALB no caminho da conta atual.
+- Um listener HTTP/80 com ação padrão para um target group HTTP/80 ainda sem targets.
 
 As subnets privadas não apontam diretamente para o Internet Gateway. Elas encaminham tráfego externo para o NAT Gateway, que permite conexões iniciadas pelos workloads privados sem aceitar conexões de entrada não solicitadas. Esse caminho atende, entre outros casos, ao polling do Argo CD sobre repositórios no GitHub.
 
@@ -67,8 +70,8 @@ A rota da prefix list do S3 é mais específica que `0.0.0.0/0` e, por longest p
 | Arquivo | Responsabilidade |
 | --- | --- |
 | `00_providers.tf` | Provider AWS, versão `~> 6.0`, região e profile. |
-| `00_variables.tf` | Variável `environment_tags`. |
-| `00_data.tf` | Availability Zones disponíveis e região atual do provider. |
+| `00_variables.tf` | Variáveis `environment_tags` e `environment`. |
+| `00_data.tf` | Availability Zones, região e identidade da conta atual. |
 | `00_output.tf` | Output com o ID do Internet Gateway. |
 | `01_vpc.tf` | Módulo VPC e Internet Gateway. |
 | `01_nat.tf` | Instância do NAT Gateway regional. |
@@ -76,7 +79,8 @@ A rota da prefix list do S3 é mais específica que `0.0.0.0/0` e, por longest p
 | `02_sg_engress_eks.tf` | SG do EKS e regras de egress para DNS, HTTPS público e S3. |
 | `02_sg_ingress_eks.tf` | Regra de ingress do EKS proveniente do SG do ALB. |
 | `03_endpoint_gateway.tf` | Gateway Endpoint do S3 nas route tables privadas. |
-| `04_alb.tf` | ALB internet-facing, SG do ALB e regras de ingress/egress. |
+| `04_alb.tf` | ALB internet-facing, listener, target group, SG do ALB e regras de ingress/egress. |
+| `05_s3.tf` | Bucket versionado e bucket policy dos access logs do ALB. |
 
 O arquivo `03_endpoint_interface.tf` foi retirado do root ativo. O módulo reutilizável continua disponível em `../modules/endpoint_interface`.
 
@@ -97,9 +101,17 @@ module.vpc
 ├── module.sg_alb
 │       ├── ingress HTTPS de 0.0.0.0/0
 │       └── egress HTTPS para module.sg_eks
+├── module.s3_alb
+│       ├── aws_s3_bucket_versioning
+│       └── aws_s3_bucket_policy.alb_access_logs
 └── module.alb_internet_facing
         ├── module.subnet-public-a/b
-        └── module.sg_alb
+        ├── module.sg_alb
+        └── module.s3_alb via access_logs
+
+module.alb_internet_facing.alb_arn ──> module.alb_listener
+module.alb_target_group.target_group_arn ──> module.alb_listener
+module.vpc.vpc_id ──> module.alb_target_group
 ```
 
 - `module.nat_gateway` recebe `module.vpc.vpc_id` e declara dependência do Internet Gateway.
@@ -107,6 +119,10 @@ module.vpc
 - As subnets privadas recebem `module.nat_gateway.nat_id`.
 - `module.s3_gateway` recebe os `route_table_id` das duas subnets privadas.
 - `module.egress_s3_gateway` recebe `module.s3_gateway.prefix_list_id`.
+- `aws_s3_bucket_policy.alb_access_logs` usa o ARN de `module.s3_alb` e limita a escrita ao caminho `AWSLogs/<account-id>/*`.
+- `module.alb_internet_facing` aguarda a bucket policy antes de habilitar os access logs.
+- `module.alb_listener` recebe o ARN do ALB e o ARN de `module.alb_target_group`, criando dependências implícitas com ambos.
+- `module.alb_target_group` recebe `module.vpc.vpc_id`; ainda não existem target attachments.
 - As referências a outputs criam dependências implícitas entre VPC, NAT, subnets, endpoint e regra de egress.
 
 ## Módulos instanciados
@@ -160,12 +176,22 @@ O SG do ALB permite ingress TCP/443 de `0.0.0.0/0` e egress TCP/443 para o SG do
 
 ### Application Load Balancer
 
-`module.alb_internet_facing` configura o ALB com `internal = false`, associa as duas subnets públicas e usa apenas `module.sg_alb`. Os nodes e pods do EKS permanecem destinados às subnets privadas; o encaminhamento futuro ocorrerá por target group usando endereços privados.
+`module.alb_internet_facing` configura o ALB com `internal = false`, associa as duas subnets públicas, usa `module.sg_alb` e habilita access logs no bucket `module.s3_alb`.
+
+`module.alb_listener` cria um listener HTTP/80 cuja ação padrão encaminha para `module.alb_target_group`. O target group `eks-workloads-http` também usa HTTP/80 e pertence à VPC ativa, mas ainda não possui targets associados.
+
+O caminho ainda não está operacional: o SG do ALB permite ingress e egress somente em TCP/443, e o SG do EKS aceita a origem do ALB somente em TCP/443. Essas regras não correspondem ao listener e ao target group em HTTP/80. Os nodes e pods do EKS também ainda não existem no root ativo.
+
+### Bucket de access logs do ALB
+
+`module.s3_alb` cria um bucket na região atual com versionamento `Enabled`. O nome combina produto, ambiente, região e account ID para reduzir colisões globais.
+
+`aws_s3_bucket_policy.alb_access_logs` concede somente `s3:PutObject` ao principal `logdelivery.elasticloadbalancing.amazonaws.com`, restrito ao caminho `AWSLogs/<account-id>/*`. O `depends_on` do caller do ALB garante que a AWS encontre essa policy quando testar a entrega dos logs.
 
 ## Estado da configuração
 
 > [!note]
-> O módulo `load_balancer` cria o ALB e associa subnets e SGs, mas ainda não cria listener, target group nem associação de targets. Esses componentes são necessários para o ALB encaminhar tráfego aos workloads.
+> O ALB possui listener e target group em HTTP/80, mas ainda não possui associação de targets. Além disso, os security groups atuais permitem TCP/443, não TCP/80; portanto, o caminho de entrada e encaminhamento ainda não está operacional.
 
 ## Comandos
 
@@ -187,16 +213,19 @@ Revise o `terraform plan` antes do apply para confirmar:
 - egress DNS UDP/TCP, HTTPS público e HTTPS para a prefix list do S3.
 - ALB associado somente às duas subnets públicas e ao SG do ALB.
 - ingress do EKS limitado à origem `module.sg_alb` na porta 443.
+- bucket S3 versionado, na mesma região do ALB, com policy de entrega restrita à conta atual.
+- listener e target group em HTTP/80, sem targets, e a divergência em relação às regras TCP/443 dos SGs.
 
 ## Limitações atuais
 
 - O cluster EKS ainda não está definido neste root.
 - O SG do EKS ainda não está associado a nodes ou pods reais.
-- O módulo de ALB ainda não possui listener, target group, targets ou access logs.
+- O target group do ALB ainda não possui targets associados nem health check customizado.
+- As portas do listener e do target group (HTTP/80) divergem das regras dos SGs do ALB e do EKS (TCP/443).
+- O bucket de access logs ainda não possui lifecycle de retenção/expiração.
 - O NAT regional simplifica HA, mas possui cobrança horária por AZ atendida e por volume processado.
 - O Gateway Endpoint reduz processamento do NAT para S3, mas ainda não possui policy customizada.
 - A tag interna `Purpose = "eks-interface-endpoints"` do NAT não representa sua finalidade atual.
 - Não existem network ACLs customizadas no projeto.
 - A região está declarada no provider, mas alguns módulos ainda possuem valores regionais fixos.
-- `data.aws_region.current` está declarado, mas ainda não é consumido por recursos ou outputs.
 - Os arquivos de `environments/dev` e `environments/prod` ainda não são roots Terraform independentes.

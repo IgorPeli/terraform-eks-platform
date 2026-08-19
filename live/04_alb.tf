@@ -6,12 +6,30 @@ module "alb_internet_facing" {
   security_group_ids = [module.sg_alb.sg_id]
   bucket             = module.s3_alb.bucket_id
   enabled            = true
+  depends_on         = [aws_s3_bucket_policy.alb_access_logs]
   tags = merge(
     var.environment_tags,
     {
       Owner = "Ig0d"
 
   })
+
+}
+
+module "alb_listener" {
+  source            = "../modules/load_balancer_listener"
+  port              = 80
+  load_balancer_arn = module.alb_internet_facing.alb_arn
+  protocol          = "HTTP"
+  target_group_arn  = module.alb_target_group.target_group_arn
+}
+
+module "alb_target_group" {
+  source   = "../modules/target_group"
+  name     = "eks-workloads-http"
+  port     = 80
+  vpc_id   = module.vpc.vpc_id
+  protocol = "HTTP"
 
 }
 
@@ -43,7 +61,6 @@ module "alb_ingress_https" {
 
 module "alb_egress_eks" {
   source = "../modules/security_group_egress_rule"
-
   from_port         = 443
   to_port           = 443
   security_group_id = module.sg_alb.sg_id

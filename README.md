@@ -12,7 +12,10 @@ O root `live` usa a região `us-east-2` e o profile `terraform-local`. Ele cria:
 - rota `0.0.0.0/0` das subnets públicas para o Internet Gateway;
 - rota `0.0.0.0/0` das subnets privadas para um NAT Gateway regional;
 - um NAT Gateway público em modo regional, associado diretamente à VPC;
-- um Gateway Endpoint do S3 associado às route tables privadas.
+- um Gateway Endpoint do S3 associado às route tables privadas;
+- um bucket S3 versionado com policy de entrega para os access logs do ALB;
+- um Application Load Balancer internet-facing nas duas subnets públicas;
+- um listener HTTP/80 que encaminha para um target group HTTP/80 ainda sem targets associados.
 
 O NAT Gateway regional fornece um único ID para as route tables privadas e expande a cobertura entre Availability Zones conforme a presença de workloads. Diferentemente do NAT Gateway zonal, ele não é criado dentro de uma subnet pública. O Internet Gateway e o NAT regional pertencem à mesma VPC; a AWS gerencia a route table própria do NAT com o caminho até o Internet Gateway.
 
@@ -38,11 +41,14 @@ O módulo `endpoint_gateway` integra a arquitetura ativa por meio do caller do S
     ├── endpoint_gateway/
     ├── endpoint_interface/
     ├── load_balancer/
+    ├── load_balancer_listener/
     ├── nat_gateway/
+    ├── s3/
     ├── security_group/
     ├── security_group_egress_rule/
     ├── security_group_ingress_rule/
     ├── subnet/
+    ├── target_group/
     └── vpc/
 ```
 
@@ -544,6 +550,61 @@ module "alb_ingress_https" {
 
 Cada instância cria somente uma regra. O contrato atual cobre apenas IPv4 e exige intervalo de portas.
 
+### `s3`
+
+Path: [`modules/s3`](modules/s3)
+
+#### Purpose
+
+Cria um bucket S3 e gerencia seu versionamento em um recurso separado.
+
+#### Intended use
+
+Criar buckets reutilizáveis com versionamento explícito. No root `live`, o módulo cria o bucket que recebe os access logs do ALB.
+
+#### Resources and behavior
+
+- Cria `aws_s3_bucket.s3` na região informada.
+- Cria `aws_s3_bucket_versioning.s3_version` associado ao bucket.
+- Aceita somente `Enabled` ou `Suspended` como estado de versionamento.
+- Não cria policy; permissões específicas de uso permanecem no caller.
+
+#### Inputs
+
+| Nome | Tipo | Obrigatório | Finalidade |
+| --- | --- | --- | --- |
+| `bucket` | `string` | sim | Nome globalmente único do bucket na partição AWS. |
+| `region` | `string` | sim | Região AWS do bucket. |
+| `status` | `string` | sim | Estado do versionamento: `Enabled` ou `Suspended`. |
+
+#### Outputs
+
+| Nome | Descrição | Consumidores |
+| --- | --- | --- |
+| `bucket_id` | ID/nome do bucket. | ALB e bucket policy no root `live`. |
+| `bucket_arn` | ARN do bucket. | Policy de entrega dos logs do ALB. |
+
+#### Dependencies and assumptions
+
+- O nome do bucket deve ser globalmente único na partição AWS.
+- O caller deve fornecer a mesma região dos serviços que exigem co-localização, como access logs do ALB.
+- A referência ao bucket cria a dependência implícita do recurso de versionamento.
+
+#### Example
+
+```hcl
+module "s3_alb" {
+  source = "../modules/s3"
+  region = data.aws_region.current.region
+  bucket = "loglume-${var.environment}-alb-access-logs-${data.aws_region.current.region}-${data.aws_caller_identity.current.account_id}"
+  status = "Enabled"
+}
+```
+
+#### Limitations and follow-ups
+
+O módulo não cria bucket policy, public access block, lifecycle de retenção ou replicação. No caller ativo, a policy é declarada separadamente porque é específica para o serviço de entrega de logs do ALB.
+
 ### `load_balancer`
 
 Path: [`modules/load_balancer`](modules/load_balancer)
@@ -560,6 +621,7 @@ Criar o ALB internet-facing nas duas subnets públicas e associar o SG do ALB.
 
 - Cria `aws_lb.test`.
 - Recebe tipo, esquema interno/público, subnets e security groups.
+- Configura access logs no bucket S3 informado pelo caller.
 - Adiciona a tag `ManagedBy = "Terraform"`.
 
 #### Inputs
@@ -572,16 +634,21 @@ Criar o ALB internet-facing nas duas subnets públicas e associar o SG do ALB.
 | `tags` | `map(string)` | sim | Tags adicionais. |
 | `subnets_ids` | `list(string)` | sim | Subnets usadas pelo load balancer. |
 | `security_group_ids` | `list(string)` | sim | Security groups associados. |
+| `enabled` | `bool` | sim | Habilita ou desabilita os access logs. |
+| `bucket` | `string` | sim | Nome do bucket que recebe os access logs. |
 
 #### Outputs
 
-Não possui outputs.
+| Nome | Descrição | Consumidores |
+| --- | --- | --- |
+| `alb_arn` | ARN do load balancer. | Módulo `load_balancer_listener` no root `live`. |
 
 #### Dependencies and assumptions
 
 - As subnets e os SGs devem pertencer à mesma VPC.
 - Um ALB internet-facing deve usar subnets públicas em Availability Zones distintas.
-- Listeners, target groups e targets são responsabilidades externas ao módulo atual.
+- O bucket de access logs deve estar na mesma região e permitir `s3:PutObject` ao serviço de log delivery do ALB.
+- Listeners, target groups e targets são responsabilidades externas a este módulo e podem ser compostos por módulos separados.
 
 #### Example
 
@@ -592,13 +659,127 @@ module "alb_internet_facing" {
   internal           = false
   subnets_ids        = [module.subnet-public-a.subnet_id, module.subnet-public-b.subnet_id]
   security_group_ids = [module.sg_alb.sg_id]
+  bucket             = module.s3_alb.bucket_id
+  enabled            = true
   tags               = var.environment_tags
+
+  depends_on = [aws_s3_bucket_policy.alb_access_logs]
 }
 ```
 
 #### Limitations and follow-ups
 
-O módulo ainda não cria listener, target group, target attachments ou health check. Access logs também ainda não são configurados.
+O módulo não cria listener, target group, target attachments ou health check. O caller deve garantir que a bucket policy exista antes de habilitar os access logs.
+
+### `load_balancer_listener`
+
+Path: [`modules/load_balancer_listener`](modules/load_balancer_listener)
+
+#### Purpose
+
+Cria um listener para um load balancer e encaminha sua ação padrão para um target group.
+
+#### Intended use
+
+Conectar um ALB existente a um target group. No root `live`, o módulo cria um listener HTTP na porta 80 para `module.alb_target_group`.
+
+#### Resources and behavior
+
+- Cria `aws_lb_listener.front_end`.
+- Define uma ação padrão do tipo `forward` para o target group informado.
+- Configura `ELBSecurityPolicy-2016-08` e usa `certificate_arn` somente quando `protocol = "HTTPS"` e `port = "443"`.
+- Para os demais protocolos ou portas, `ssl_policy` e `certificate_arn` ficam nulos.
+
+#### Inputs
+
+| Nome | Tipo | Obrigatório | Finalidade |
+| --- | --- | --- | --- |
+| `load_balancer_arn` | `string` | sim | ARN do load balancer que recebe o listener. |
+| `port` | `string` | sim | Porta em que o listener atende. |
+| `protocol` | `string` | sim | Protocolo do listener, como `HTTP` ou `HTTPS`. |
+| `certificate_arn` | `string` | não | ARN do certificado usado por HTTPS/443; padrão `null`. |
+| `target_group_arn` | `string` | sim | ARN do target group da ação padrão. |
+
+#### Outputs
+
+Não possui outputs.
+
+#### Dependencies and assumptions
+
+- O load balancer e o target group devem existir e ser compatíveis com o protocolo configurado.
+- As referências aos ARNs criam dependências implícitas com os módulos de ALB e target group.
+- O caller deve alinhar a porta do listener com as regras de ingress do security group do ALB.
+
+#### Example
+
+```hcl
+module "alb_listener" {
+  source            = "../modules/load_balancer_listener"
+  port              = 80
+  load_balancer_arn = module.alb_internet_facing.alb_arn
+  protocol          = "HTTP"
+  target_group_arn  = module.alb_target_group.target_group_arn
+}
+```
+
+#### Limitations and follow-ups
+
+O módulo oferece somente uma ação padrão `forward`. Não há validação explícita de protocolos e portas, regras adicionais, redirect, fixed response, autenticação ou suporte a uma policy TLS configurável.
+
+### `target_group`
+
+Path: [`modules/target_group`](modules/target_group)
+
+#### Purpose
+
+Cria um target group de load balancer em uma VPC.
+
+#### Intended use
+
+Definir o destino lógico de um listener antes de associar workloads. No root `live`, o módulo cria `eks-workloads-http` em HTTP/80.
+
+#### Resources and behavior
+
+- Cria `aws_lb_target_group.target_group`.
+- Recebe nome, porta, protocolo e VPC do caller.
+- Usa os comportamentos padrão do provider para target type, health check e demais opções não declaradas.
+
+#### Inputs
+
+| Nome | Tipo | Obrigatório | Finalidade |
+| --- | --- | --- | --- |
+| `vpc_id` | `string` | sim | VPC em que o target group é criado. |
+| `name` | `string` | sim | Nome do target group. |
+| `port` | `string` | sim | Porta usada para encaminhar tráfego aos targets. |
+| `protocol` | `string` | sim | Protocolo do target group. |
+
+#### Outputs
+
+| Nome | Descrição | Consumidores |
+| --- | --- | --- |
+| `target_group_arn` | ARN do target group. | Módulo `load_balancer_listener` no root `live`. |
+
+#### Dependencies and assumptions
+
+- O target group deve pertencer à mesma VPC dos targets que serão associados.
+- A referência a `module.vpc.vpc_id` cria dependência implícita com a VPC.
+- Porta e protocolo devem ser compatíveis com os targets e com as regras dos security groups envolvidos.
+
+#### Example
+
+```hcl
+module "alb_target_group" {
+  source   = "../modules/target_group"
+  name     = "eks-workloads-http"
+  port     = 80
+  vpc_id   = module.vpc.vpc_id
+  protocol = "HTTP"
+}
+```
+
+#### Limitations and follow-ups
+
+O módulo não associa targets e não expõe configurações de health check, target type, deregistration delay, stickiness ou atributos avançados.
 
 ## Root ativo
 
@@ -607,7 +788,7 @@ Consulte [`live/README.md`](live/README.md) para o mapa dos arquivos, fluxo de d
 ## Próximos passos
 
 - Associar `module.sg_eks` aos nodes ou pods do EKS quando o cluster for criado.
-- Completar o módulo de ALB com listener, target group, targets e, se necessário, access logs.
+- Associar targets ao target group do ALB e alinhar as portas do listener/target group com os security groups.
 - Executar `terraform init`, `terraform validate` e `terraform plan` após concluir a transição.
 - Monitorar custos e confirmar que o tráfego S3 usa o Gateway Endpoint em vez do NAT.
 - Remover valores regionais fixos dos módulos caso o projeto precise suportar outras regiões.
