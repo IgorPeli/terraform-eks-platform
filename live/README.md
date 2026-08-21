@@ -2,6 +2,8 @@
 
 Esta pasta é o root Terraform executado atualmente. Os comandos `terraform init`, `terraform validate`, `terraform plan` e `terraform apply` devem ser executados aqui.
 
+O root declara um backend S3 parcial em `00_backend.tf`. Bucket, região e chave são fornecidos no `terraform init` por `../environments/dev/backend.hcl` ou `../environments/prod/backend.hcl`; assim, os dois ambientes reutilizam a mesma configuração Terraform e mantêm estados separados.
+
 ## Configuração atual
 
 - Provider AWS na região `us-east-2`, usando o profile `terraform-local`.
@@ -69,6 +71,7 @@ A rota da prefix list do S3 é mais específica que `0.0.0.0/0` e, por longest p
 
 | Arquivo | Responsabilidade |
 | --- | --- |
+| `00_backend.tf` | Declara o backend S3 parcial, preenchido pelo `backend.hcl` do ambiente durante o `init`. |
 | `00_providers.tf` | Provider AWS, versão `~> 6.0`, região e profile. |
 | `00_variables.tf` | Variáveis `environment_tags` e `environment`. |
 | `00_data.tf` | Availability Zones, região e identidade da conta atual. |
@@ -83,6 +86,25 @@ A rota da prefix list do S3 é mais específica que `0.0.0.0/0` e, por longest p
 | `05_s3.tf` | Bucket versionado e bucket policy dos access logs do ALB. |
 
 O arquivo `03_endpoint_interface.tf` foi retirado do root ativo. O módulo reutilizável continua disponível em `../modules/endpoint_interface`.
+
+## Estado remoto e automação
+
+Os arquivos de ambiente ficam fora deste root e são selecionados explicitamente:
+
+| Ambiente | Backend config | Var file | Chave S3 |
+| --- | --- | --- | --- |
+| `dev` | `../environments/dev/backend.hcl` | `../environments/dev/dev.tfvars` | `dev/terraform.tfstate` |
+| `prod` | `../environments/prod/backend.hcl` | `../environments/prod/prod.tfvars` | `prod/terraform.tfstate` |
+
+O bucket `meu-bucket-tfstate` presente nos dois `backend.hcl` é um placeholder e precisa ser substituído por um bucket já existente. Os arquivos `.tfvars` estão vazios; por enquanto, ambos os ambientes usam os defaults de `environment` e `environment_tags`, inclusive `environment = "dev"`, até que recebam valores próprios.
+
+O workflow `../.github/workflows/terraform.yaml` executa a partir deste diretório. Pull requests para `develop` usam o GitHub Environment `dev`; pull requests para `main` usam `prod`. Pushes nessas branches executam `plan` e `apply` automaticamente no ambiente correspondente. Os environments precisam fornecer:
+
+- `AWS_ROLE_ARN`: role assumida pelo runner via OIDC;
+- `BACKEND_CONFIG`: caminho relativo a `live`, como `../environments/prod/backend.hcl`;
+- `TFVARS_FILE`: caminho relativo a `live`, como `../environments/prod/prod.tfvars`.
+
+O provider fixa `profile = "terraform-local"`. Esse profile é adequado apenas onde estiver configurado e pode bloquear o uso das credenciais OIDC no runner; a configuração precisa ser conciliada antes do primeiro apply pelo workflow.
 
 ## Fluxo de dependências
 
@@ -196,12 +218,14 @@ O caminho ainda não está operacional: o caller não informa `certificate_arn` 
 ## Comandos
 
 ```bash
-terraform init
+terraform init -reconfigure -backend-config=../environments/dev/backend.hcl
 terraform fmt -recursive
 terraform validate
-terraform plan
-terraform apply
+terraform plan -var-file=../environments/dev/dev.tfvars -out=tfplan
+terraform apply tfplan
 ```
+
+Para produção, substitua os dois caminhos de `dev` pelos equivalentes em `prod`. Confirme o workspace, a conta AWS e a chave do backend antes de qualquer `apply`.
 
 Revise o `terraform plan` antes do apply para confirmar:
 
@@ -229,3 +253,7 @@ Revise o `terraform plan` antes do apply para confirmar:
 - Não existem network ACLs customizadas no projeto.
 - A região está declarada no provider, mas alguns módulos ainda possuem valores regionais fixos.
 - Os arquivos de `environments/dev` e `environments/prod` ainda não são roots Terraform independentes.
+- O bucket dos arquivos `backend.hcl` ainda é um placeholder e não há configuração explícita de locking no backend.
+- Os arquivos `dev.tfvars` e `prod.tfvars` estão vazios; sem valores próprios, produção também recebe o default `environment = "dev"`.
+- O workflow depende de GitHub Environments e de uma role OIDC ainda não versionados no repositório.
+- O profile fixo `terraform-local` do provider pode impedir que o runner use as credenciais OIDC configuradas pelo workflow.

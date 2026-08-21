@@ -21,6 +21,39 @@ O NAT Gateway regional fornece um único ID para as route tables privadas e expa
 
 O root ativo deixa de instanciar os Interface Endpoints do ECR. O tráfego externo geral de workloads privados, inclusive o acesso do Argo CD ao GitHub, usa a rota default para o NAT Gateway. O tráfego destinado ao S3 usa a rota mais específica, baseada na prefix list do Gateway Endpoint, e evita o processamento pelo NAT. Security groups e network ACLs continuam responsáveis por autorizar o tráfego; a existência da rota não substitui essas permissões.
 
+O estado do root `live` passa a usar um backend S3 parcial, declarado em `live/00_backend.tf` e completado pelos arquivos `environments/dev/backend.hcl` e `environments/prod/backend.hcl`. Um workflow do GitHub Actions executa `plan` em pull requests e `apply` em pushes para `develop` e `main`, selecionando os GitHub Environments `dev` e `prod` conforme a branch.
+
+## Diagrama: estado atual e evolução planejada
+
+```mermaid
+flowchart LR
+    subgraph Atual[Estado atual no repositório]
+        PR[Pull request] --> PLAN[GitHub Actions: plan]
+        PUSH[Push em develop/main] --> APPLY[GitHub Actions: apply]
+        PLAN --> ROOT[Root Terraform live]
+        APPLY --> ROOT
+        ROOT --> STATE[(Backend S3 por ambiente)]
+        ROOT --> VPC[VPC e subnets públicas/privadas]
+        VPC --> NAT[NAT Gateway regional]
+        VPC --> S3EP[Gateway Endpoint S3]
+        VPC --> ALB[ALB HTTPS/443]
+        ALB --> TG[Target group HTTP/80 sem targets]
+    end
+
+    subgraph Futuro[Próximas entregas]
+        PRE[Configurar bucket, OIDC e variáveis do GitHub] --> CICD[Validar pipeline remoto]
+        ACM[Provisionar certificado ACM] --> TLS[Informar certificate_arn]
+        EKS[Criar cluster e workloads EKS] --> ATTACH[Associar targets ao target group]
+        TLS --> TRAFEGO[Caminho HTTPS operacional]
+        ATTACH --> TRAFEGO
+        OBS[Adicionar retenção e observabilidade] --> OPERACAO[Operação acompanhada]
+    end
+
+    Atual -. habilita .-> Futuro
+```
+
+As caixas do primeiro grupo representam recursos ou configuração já presentes no código. O segundo grupo representa trabalho ainda não implementado; ele não é uma garantia de recursos atualmente provisionados.
+
 ### Decisão sobre VPC Endpoints
 
 A arquitetura foi simplificada para usar o NAT Gateway como saída geral e evitar a manutenção de Interface Endpoints específicos para cada serviço consumido pelo EKS, pelos add-ons e pelo Argo CD. A redução de custos vem da retirada dos Interface Endpoints, cobrados por hora em cada Availability Zone e pelo volume processado. O NAT Gateway também possui cobrança por hora/AZ e por volume; portanto, a economia efetiva depende do perfil de tráfego e deve ser acompanhada.
@@ -33,10 +66,18 @@ O módulo `endpoint_gateway` integra a arquitetura ativa por meio do caller do S
 
 ```text
 .
+├── .github/
+│   └── workflows/
+│       └── terraform.yaml
 ├── environments/
 │   ├── dev/
+│   │   ├── backend.hcl
+│   │   └── dev.tfvars
 │   └── prod/
+│       ├── backend.hcl
+│       └── prod.tfvars
 ├── live/
+│   └── 00_backend.tf
 └── modules/
     ├── endpoint_gateway/
     ├── endpoint_interface/
@@ -56,18 +97,40 @@ O módulo `endpoint_gateway` integra a arquitetura ativa por meio do caller do S
 
 ```bash
 cd live
-terraform init
+terraform init -reconfigure -backend-config=../environments/dev/backend.hcl
 terraform fmt -recursive
 terraform validate
-terraform plan
-terraform apply
+terraform plan -var-file=../environments/dev/dev.tfvars -out=tfplan
+terraform apply tfplan
 ```
 
-As pastas `environments/dev` e `environments/prod` estão reservadas para configuração futura, mas a configuração raiz executada atualmente é `live`.
+Troque `dev` por `prod` para trabalhar com o estado e as variáveis de produção. O bucket informado no arquivo de backend deve existir antes de `terraform init`; o backend não cria o próprio bucket.
 
 ## Ambientes
 
-As duas pastas contêm apenas arquivos `backend.tf` vazios. Ainda não existem `terraform.tfvars` nem roots independentes; a execução acontece em `live`.
+`environments/dev` e `environments/prod` não são roots Terraform independentes. Cada pasta contém um `backend.hcl`, que seleciona uma chave de estado diferente no S3, e um arquivo `.tfvars`, atualmente vazio, que usa os defaults do root `live`.
+
+| Ambiente | Backend | Chave do estado | Variáveis |
+| --- | --- | --- | --- |
+| `dev` | `environments/dev/backend.hcl` | `dev/terraform.tfstate` | `environments/dev/dev.tfvars` |
+| `prod` | `environments/prod/backend.hcl` | `prod/terraform.tfstate` | `environments/prod/prod.tfvars` |
+
+Os dois backends ainda usam `meu-bucket-tfstate` como placeholder. Substitua-o pelo bucket real antes da primeira inicialização remota.
+
+## Automação no GitHub Actions
+
+O workflow [`.github/workflows/terraform.yaml`](.github/workflows/terraform.yaml) trabalha a partir de `live/` e usa autenticação AWS via OIDC:
+
+| Evento | Branch de destino | GitHub Environment | Ação Terraform |
+| --- | --- | --- | --- |
+| Pull request | `develop` | `dev` | `init`, `fmt -check`, `validate` e `plan` |
+| Pull request | `main` | `prod` | `init`, `fmt -check`, `validate` e `plan` |
+| Push | `develop` | `dev` | `init`, `validate`, `plan -out=tfplan` e `apply` |
+| Push | `main` | `prod` | `init`, `validate`, `plan -out=tfplan` e `apply` |
+
+Cada GitHub Environment precisa definir `AWS_ROLE_ARN`, `BACKEND_CONFIG` e `TFVARS_FILE`. Como o diretório de trabalho do job é `live`, os caminhos esperados são, por exemplo, `../environments/dev/backend.hcl` e `../environments/dev/dev.tfvars`.
+
+O provider ainda declara `profile = "terraform-local"`. Esse profile atende à execução local, mas não existe por padrão no runner do GitHub; a compatibilidade com as credenciais OIDC deve ser resolvida antes de considerar o pipeline operacional.
 
 ## Contratos dos módulos
 
@@ -788,6 +851,10 @@ Consulte [`live/README.md`](live/README.md) para o mapa dos arquivos, fluxo de d
 
 ## Próximos passos
 
+- Criar ou selecionar o bucket S3 de estado e substituir `meu-bucket-tfstate` nos dois arquivos `backend.hcl`.
+- Configurar os GitHub Environments `dev` e `prod`, a role OIDC e as variáveis `AWS_ROLE_ARN`, `BACKEND_CONFIG` e `TFVARS_FILE`.
+- Compatibilizar a configuração do provider com execução local por profile e execução no GitHub Actions por OIDC.
+- Validar `plan` em pull request antes de habilitar o primeiro `apply` automático por push.
 - Associar `module.sg_eks` aos nodes ou pods do EKS quando o cluster for criado.
 - Criar e validar um certificado ACM e informar seu ARN ao listener HTTPS/443.
 - Associar targets HTTP/80 ao target group do ALB, de forma compatível com o tipo de target e com o workload do EKS.
